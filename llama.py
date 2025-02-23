@@ -119,8 +119,6 @@ def update_base_addr(base_addr: int, tensor, advance: bool) -> int:
     return next_base_addr
 
 
-
-
 @nki.compiler.skip_middle_end_transformations
 @nki.jit
 def nki_fused_rms_norm_qkv(hidden, gamma, weights, hidden_buffer_degree, eps):
@@ -352,6 +350,79 @@ def nki_fused_rms_norm_qkv(hidden, gamma, weights, hidden_buffer_degree, eps):
     return out_tensor
 
 
+
+@nki.jit
+def nki_fused_rms_norm_qkv_single_token(hidden, gamma, weights, eps):
+    """
+    Allocated kernel that computes RMSNorm(hidden) @ wQKV. This kernel is designed to only handle fp16/bf16 tensor types.
+    Internally, normalizations are cast to fp32 to avoid NaN errors.
+
+    Args:
+        hidden (_type_): Input tensor of the attention block in BSH layout
+        weights (_type_): Fused QKV linear weights, assumed to be eltwise-multiplied with RMS norm weight vector (gamma)
+        eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
+    """
+    # Hidden should be in BSH layout.
+
+
+    B, S, H = hidden.shape
+    L, H = weights.shape
+    output_tensor = nl.ndarray((B, S, L), dtype=hidden.dtype, buffer=nl.shared_hbm)
+    gamma_bcast = nl.load(gamma.reshape((1, H)))
+    scale = 1 / H
+    TILE_P = nl.tile_size.pmax 
+    for b in nl.affine_range(B):
+
+        in_bufs = nl.load(hidden[b])
+        square_sum = nl.ndarray(
+                        (1, 1),
+                        dtype=nl.float32,
+                        buffer=nl.sbuf,
+                    )
+        act = nisa.activation_reduce(
+                        op=nl.square,
+                        data=in_bufs,
+                        reduce_op=np.add,
+                        reduce_res=square_sum,
+
+                    )
+        square_sum[...] = nisa.tensor_scalar(
+                        square_sum[...], np.multiply, scale, op1=np.add, operand1=eps
+                    )
+        square_sum[...] = nisa.activation(
+            op=nl.rsqrt, data=square_sum[...]
+        )
+        
+        output_tile = nl.multiply(
+                        in_bufs,
+                        square_sum[...],
+                        dtype=hidden.dtype,
+                    )
+
+        # Multiply with the RMSNorm weight
+        output_tile[...] = nl.multiply(
+            output_tile[...], gamma_bcast[...]
+        )
+
+
+        output_tile = output_tile.broadcast_to((TILE_P, H))
+        
+        for i in nl.affine_range(L // TILE_P):
+            weight_tile = nl.load(weights[i * TILE_P: (i + 1) * TILE_P, :])
+            dot_tensor = nisa.tensor_tensor(weight_tile, output_tile, op=nl.multiply)
+
+            reduce_tensor = nisa.tensor_reduce(nl.add, dot_tensor, axis=[1])
+    
+            nl.store(output_tensor[b, 0, i * TILE_P: (i + 1) * TILE_P],
+                    value=reduce_tensor)
+
+
+   
+    return output_tensor
+
+
+
+
 @nki.jit
 def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
     # Calculate out_tensor = a_tensor/RMS(a_tensor) * g_tensor
@@ -557,12 +628,9 @@ def nki_matmul_fully_optimized_copy_(
   assert N % BLOCK_N == 0
   assert K % BLOCK_K == 0
 
-#   NUM_BLOCK_M = M // BLOCK_M 
-#   NUM_BLOCK_N = N // BLOCK_N 
-#   NUM_BLOCK_K = K // BLOCK_K 
-  NUM_BLOCK_M = (M+BLOCK_M-1) // BLOCK_M
-  NUM_BLOCK_N = (N+BLOCK_N-1) // BLOCK_N
-  NUM_BLOCK_K = (K+BLOCK_K-1) // BLOCK_K
+  NUM_BLOCK_M = M // BLOCK_M 
+  NUM_BLOCK_N = N // BLOCK_N 
+  NUM_BLOCK_K = K // BLOCK_K 
   
   for b in nl.affine_range(B):
     for n in nl.affine_range(NUM_BLOCK_N):
@@ -754,6 +822,78 @@ def nki_rmsnorm(hidden, gamma, hidden_buffer_degree=1, eps=1e-6):
 
 
 
+@nki.jit
+def nki_rmsnorm_single_token(hidden, gamma, hidden_buffer_degree=1, eps=1e-6):
+    """
+    Allocated kernel that computes RMSNorm(hidden). This kernel is designed to only handle fp16/bf16 tensor types.
+    Internally, normalizations are cast to fp32 to avoid NaN errors.
+
+    Args:
+        hidden (_type_): Input tensor of the attention block in BSH layout
+        eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
+    """
+    # Hidden should be in BSH layout.
+    batch, batchless_shape = hidden.shape[0], hidden.shape[1:]
+    seqlen, dim = batchless_shape
+    assert (
+        dim == gamma.shape[0]
+    ), f"gamma {gamma.shape} does not match with hidden {hidden.shape}"
+    # assert gamma.dtype == hidden.dtype, "Gamma must match hidden dtype"
+    assert dim <= 8192 and dim % 128 == 0, "Unsupported hidden dimension"
+
+    norm_dtype = nl.float32
+    # norm_dtype = hidden.dtype
+
+    out_tensor = nl.ndarray(
+        (batch, seqlen, dim), dtype=hidden.dtype, buffer=nl.shared_hbm
+    )
+
+    scale = 1 / dim
+
+    # Allocate broadcasted gamma buffer
+    gamma_bcast = nl.load(gamma.reshape((1, dim)))
+    for b in nl.affine_range(batch):
+        in_bufs = nl.load(hidden[b])
+        square_sum = nl.ndarray(
+                        (1, 1),
+                        dtype=norm_dtype,
+                        buffer=nl.sbuf,
+                    )
+        act = nisa.activation_reduce(
+                        op=nl.square,
+                        data=in_bufs,
+                        reduce_op=np.add,
+                        reduce_res=square_sum,
+
+                    )
+        square_sum[...] = nisa.tensor_scalar(
+                        square_sum[...], np.multiply, scale, op1=np.add, operand1=eps
+                    )
+        square_sum[...] = nisa.activation(
+            op=nl.rsqrt, data=square_sum[...]
+        )
+        
+        output_tile = nl.multiply(
+                        in_bufs,
+                        square_sum[...],
+                        dtype=hidden.dtype,
+                    )
+
+        # Multiply with the RMSNorm weight
+        output_tile[...] = nl.multiply(
+            output_tile[...], gamma_bcast[...]
+        )
+
+        # Store result
+        nl.store(
+            out_tensor[b],
+            value=output_tile,
+        )
+
+    return out_tensor
+
+
+
 # @nki.jit(mode="torchxla")
 def nki_matmul(hidden, weight):
 
@@ -875,22 +1015,42 @@ class CustomRMSNorm(nn.Module):
 
     def forward(self, hidden_states):
         if self.nki_enabled:
-            # original_dtype = hidden_states.dtype
 
-            # hidden_states = hidden_states.to(torch.float32)
-            # self.weight = self.weight.to(torch.float32)
-            # out_tensor = nki_rmsnorm_kernel(hidden_states, self.weight, self.variance_epsilon)
-            out_tensor = nki_rmsnorm(hidden=hidden_states, gamma=self.weight, eps=self.variance_epsilon)
-
-            # out_tensor = out_tensor.to(original_dtype)
+            if hidden_states.shape[1] == 1:  # token generation
+                # out_tensor = nki_rmsnorm_single_token(hidden=hidden_states, gamma=self.weight, eps=self.variance_epsilon)
+                
+                original_dtype = hidden_states.dtype
+                hidden_states = hidden_states.to(torch.float32)
+                out_tensor = RmsNorm.apply(
+                    hidden_states, self.weight, self.variance_epsilon, len(hidden_states.shape) - 1
+                )
+                out_tensor = out_tensor.to(original_dtype)
+            
+            else:
+                out_tensor = nki_rmsnorm(hidden=hidden_states, gamma=self.weight, eps=self.variance_epsilon)
+            
             return out_tensor
+
+
+        # def torch_rmsnorm_kernel(a_tensor, g_tensor, eps):
+        #     # Square the tensor (element-wise)
+        #     in_square = a_tensor.pow(2)
+        #     # Calculate means in the free dimension
+        #     mean = in_square.mean(dim=1, keepdim=True)
+
+        #     s = mean + eps
+        #     # Scale by reciprocal of sqrt(mean)
+        #     tensor = a_tensor * torch.rsqrt(s)
+
+        #     # Scale the output by the weight
+        #     return tensor * g_tensor
+        # out_tensor = torch_rmsnorm_kernel(hidden_states, self.weight, self.variance_epsilon)
 
         original_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         result = RmsNorm.apply(
             hidden_states, self.weight, self.variance_epsilon, len(hidden_states.shape) - 1
         )
-
         return result.to(original_dtype)
 
 
@@ -1050,7 +1210,8 @@ class NkiLinearWithAsyncCommunication(LinearWithAsyncCommunication):
         ##############################
         
         if total_input.shape[1] == 1:
-            output = nki_sinle_token_matmul_(total_input, weight)
+            # output = nki_sinle_token_matmul_(total_input, weight)
+            output = torch.einsum('...m,mn->...n', total_input, weight.t())
         else:
             B, M, K = total_input.shape
             N, K_ = weight.shape
@@ -1541,7 +1702,116 @@ class NkiRowParallelLinear(RowParallelLinear):
 
 
 class NkiGroupQueryAttention_QKV(GroupQueryAttention_QKV):
-  
+    def __init__(
+        self,
+        hidden_size: int,
+        head_dim: int,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        tp_degree: int = 1,
+        dtype: torch.dtype = torch.float32,
+        bias: bool = False,
+        desired_sharding_strategy: Optional[GQA] = None,
+        gather_output: bool = True,
+        fused_qkv: bool = False,
+        clip_qkv: Optional[float] = None,
+        sequence_parallel_enabled: bool = False,
+        sequence_dimension: Optional[int] = None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        rms_norm_eps: float = None,
+        qkv_kernel_enabled: bool = False,
+        logical_neuron_cores: int = 1,
+    ):
+        super().__init__(
+            hidden_size=hidden_size,
+            head_dim=head_dim,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            tp_degree=tp_degree,
+            dtype=dtype,
+            bias=bias,
+            desired_sharding_strategy=desired_sharding_strategy,
+            gather_output = gather_output,
+            fused_qkv = fused_qkv,
+            clip_qkv = clip_qkv,
+            sequence_parallel_enabled = sequence_parallel_enabled,
+            sequence_dimension = sequence_dimension,
+            tensor_model_parallel_group = tensor_model_parallel_group,
+            rms_norm_eps = rms_norm_eps,
+            qkv_kernel_enabled = qkv_kernel_enabled,
+            logical_neuron_cores = logical_neuron_cores,
+        )
+        
+
+        if self.tensor_model_parallel_group is not None:
+            if self.fused_qkv:
+                self.Wqkv = NkiColumnParallelLinear(
+                    self.hidden_size,
+                    (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim,
+                    bias=self.bias,
+                    gather_output=self.gather_output,
+                    dtype=dtype,
+                    tensor_model_parallel_group=self.tensor_model_parallel_group,
+                )
+                if self.qkv_kernel_enabled:
+                    # we need to transpose the weights on the CPU side to avoid
+                    # needing to transpose on the device when using QKV kernel
+                    self.Wqkv.weight = transpose_parallel_linear_layer(self.Wqkv.weight)
+
+                # Set heads info as weight parameter attributes to be used in weights sharding
+                setattr(self.Wqkv.weight, "fused_qkv", True)
+                setattr(self.Wqkv.weight, "num_attention_heads", self.num_attention_heads)
+                setattr(self.Wqkv.weight, "num_key_value_heads", self.num_key_value_heads)
+                setattr(self.Wqkv.weight, "head_dim", self.head_dim)
+
+            else:
+                self.q_proj = NkiColumnParallelLinear(
+                    self.hidden_size,
+                    self.num_attention_heads * self.head_dim,
+                    bias=self.bias,
+                    gather_output=self.gather_output,
+                    dtype=dtype,
+                    sequence_parallel_enabled=False,
+                    tensor_model_parallel_group=self.tensor_model_parallel_group,
+                )
+                self.k_proj = NkiColumnParallelLinear(
+                    self.hidden_size,
+                    self.num_key_value_heads * self.head_dim,
+                    bias=self.bias,
+                    gather_output=self.gather_output,
+                    dtype=dtype,
+                    sequence_parallel_enabled=False,
+                    tensor_model_parallel_group=self.tensor_model_parallel_group,
+                )
+                self.v_proj = NkiColumnParallelLinear(
+                    self.hidden_size,
+                    self.num_key_value_heads * self.head_dim,
+                    bias=self.bias,
+                    gather_output=self.gather_output,
+                    dtype=dtype,
+                    sequence_parallel_enabled=False,
+                    tensor_model_parallel_group=self.tensor_model_parallel_group,
+                )
+        else:
+            if self.fused_qkv:
+                self.Wqkv = nn.Linear(
+                    self.hidden_size,
+                    (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim,
+                    bias=self.bias,
+                )
+            else:
+                self.q_proj = nn.Linear(
+                    self.hidden_size, self.num_attention_heads * self.head_dim, bias=self.bias
+                )
+                self.k_proj = nn.Linear(
+                    self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.bias
+                )
+                self.v_proj = nn.Linear(
+                    self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.bias
+                )
+
+
+
     def _kernel_qkv_forward(self, hidden_states, fused_rmsnorm, rmsnorm):
         logger.debug(
             f"QKV kernel: fused_rmsnorm={fused_rmsnorm} logical_neuron_cores={self.logical_neuron_cores}"
@@ -1589,12 +1859,25 @@ class NkiGroupQueryAttention_QKV(GroupQueryAttention_QKV):
         # )
         ########################################################################
     
+        
+        # if hidden_states.shape[1] == 1:
+        #     QKV = nki_fused_rms_norm_qkv_single_token(hidden=hidden_states, 
+        #                         gamma=rmsnorm.weight.unsqueeze(0),
+        #                         weights=self.Wqkv.weight.t(),
+        #                         eps=self.rms_norm_eps)
+        # else:
+        #     QKV = nki_fused_rms_norm_qkv(hidden=hidden_states, 
+        #                         gamma=rmsnorm.weight.unsqueeze(0),
+        #                         weights=self.Wqkv.weight,
+        #                         hidden_buffer_degree=1,
+        #                         eps=self.rms_norm_eps)
         QKV = nki_fused_rms_norm_qkv(hidden=hidden_states, 
                                 gamma=rmsnorm.weight.unsqueeze(0),
                                 weights=self.Wqkv.weight,
                                 hidden_buffer_degree=1,
                                 eps=self.rms_norm_eps)
         
+
         ########################################################################
         return self._split_fused_qkv(QKV)
 
