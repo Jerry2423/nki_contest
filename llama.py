@@ -23,29 +23,16 @@ import gc
 import logging
 import math
 from typing import List, Optional, Tuple, Type
-from neuronx_distributed.parallel_layers import utils 
+
 import torch
 from neuronx_distributed.parallel_layers import parallel_state  # noqa: E402
 from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
     ColumnParallelLinear,
     ParallelEmbedding,
     RowParallelLinear,
-    LinearWithAsyncCommunication,
-)
-from neuronx_distributed.parallel_layers.utils import (
-cast_if_autocast_enabled,
-verify_casted_dtype,)
-
-from torch.distributed import ProcessGroup
-from typing import (
-    Optional, Tuple, Union, Any, Callable, Dict, Type, cast
 )
 from neuronx_distributed.parallel_layers.mappings import (
-    _gather_along_dim,
-    gather_from_tensor_model_parallel_region,
-    copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
-    scatter_to_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
@@ -68,7 +55,7 @@ from torch_neuronx.xla_impl.ops import nki_jit
 from transformers import LlamaForCausalLM
 from transformers.activations import ACT2FN
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
-from neuronxcc.nki.language import par_dim
+
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig  # noqa: E402
 from neuronx_distributed_inference.models.model_base import (  # noqa: E402
     NeuronBaseForCausalLM,
@@ -77,7 +64,6 @@ from neuronx_distributed_inference.models.model_base import (  # noqa: E402
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402
     BaseGroupQueryAttention,
-    GQA, GroupQueryAttention_O, GroupQueryAttention_QKV 
 )
 from neuronx_distributed_inference.modules.attention.utils import (
     RotaryEmbedding,
@@ -89,267 +75,15 @@ from neuronx_distributed_inference.modules.attention.utils import (
 from neuronx_distributed_inference.modules.flashdecode.utils import calculate_num_cores_per_group
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
 from neuronx_distributed_inference.utils.distributed import get_tp_group
-import neuronxcc.nki.isa as nisa
+
 from torch_neuronx.xla_impl.ops import RmsNorm
-import numpy as np
+
 import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
-import neuronxcc.nki.compiler as ncc
+
 _LLAMA_MODULE_MAP = {}
 
 logger = logging.getLogger("Neuron")
-
-def update_base_addr(base_addr: int, tensor, advance: bool) -> int:
-    if tensor.ndim == 2:
-        # pardim, fdim
-        buf_size = tensor.shape[1] * tensor.itemsize
-    elif tensor.ndim == 3:
-        # block_dim, pardim, fdim
-        buf_size = tensor.shape[0] * tensor.shape[2] * tensor.itemsize
-    else:
-        raise NotImplementedError(
-            f"Buffer size for tensor shape {tensor.shape} is unknown"
-        )
-    if advance:
-        next_base_addr = base_addr + buf_size
-        print(f"Allocate buf @ {base_addr} -> {next_base_addr}")
-    else:
-        next_base_addr = base_addr - buf_size
-        print(f"Restore buf @ {base_addr} -> {next_base_addr}")
-    return next_base_addr
-
-
-
-
-@nki.compiler.skip_middle_end_transformations
-@nki.jit
-def nki_fused_rms_norm_qkv(hidden, gamma, weights, hidden_buffer_degree, eps):
-    """
-    Allocated kernel that computes RMSNorm(hidden) @ wQKV. This kernel is designed to only handle fp16/bf16 tensor types.
-    Internally, normalizations are cast to fp32 to avoid NaN errors.
-
-    Args:
-        hidden (_type_): Input tensor of the attention block in BSH layout
-        weights (_type_): Fused QKV linear weights, assumed to be eltwise-multiplied with RMS norm weight vector (gamma)
-        eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
-    """
-    # Hidden should be in BSH layout.
-    batch, batchless_shape = hidden.shape[0], hidden.shape[1:]
-    seqlen, dim = batchless_shape
-    _dim, head_dim = weights.shape
-
-    assert dim <= 8192 and dim & 128 == 0, "Unsupported hidden dimension"
-    assert _dim == dim, "Reduction dimension must match"
-    # assert head_dim <= 512, "Head dimension must be 512 or less"
-
-    norm_dtype = nl.float32
-    # norm_dtype = hidden.dtype
-
-    out_tensor = nl.ndarray(
-        (batch, seqlen, head_dim), dtype=hidden.dtype, buffer=nl.shared_hbm
-    )
-
-    pmax, fmax = nl.tile_size.pmax, nl.tile_size.psum_fmax  # 128, 512
-    ix, iy = nl.mgrid[0:pmax, 0:dim]
-    i_lhs = nl.mgrid[0:pmax, 0:pmax]
-    i_rhs = nl.mgrid[0:pmax, 0:fmax]
-    i_res = nl.mgrid[0:pmax, 0:fmax]
-    M = math.ceil(dim / pmax)
-    N = math.ceil(head_dim / fmax)
-    NUM_TRANSP_TILES = math.ceil(dim / fmax)
-    NUM_TILES = math.ceil(seqlen / pmax)
-    TILES_INT = math.ceil(NUM_TILES / hidden_buffer_degree)
-    scale = 1 / dim
-    sbuf_base_addr = 0
-    
-    gamma_bcast = nl.ndarray(
-        (par_dim(pmax), dim),
-        dtype=gamma.dtype,
-        buffer=nl.sbuf,
-    )
-    i_f = nl.arange(dim)[None, :]
-    i_w = nl.arange(1)[:, None] 
-    # FIXME: Change to more efficient NKI broadcast APIs when they become available.
-    for i in nl.affine_range(pmax):
-        gamma_bcast[i, i_f] = nl.load(
-            gamma.reshape((1, dim))[i_w, i_f], dtype=gamma.dtype
-        )
-
-    iden_x, iden_y = nl.mgrid[0:pmax, 0:128]
-
-    identity_a = nl.shared_constant(
-        np.identity(n=128, dtype=np.int8), dtype=hidden.dtype
-    )
-    identity_tensor = nl.ndarray(
-        (par_dim(pmax), 128),
-        dtype=weights.dtype,
-        buffer=nl.sbuf,
-    )
-
-    # sbuf_base_addr = update_base_addr(sbuf_base_addr, identity_tensor, True)
-    identity_tensor[iden_x, iden_y] = nl.load(identity_a, dtype=weights.dtype)
-    bias_placeholder = nl.ndarray(
-        (par_dim(pmax), 1),
-        dtype=np.float32,
-        buffer=nl.sbuf,
-    )
-    # sbuf_base_addr = update_base_addr(sbuf_base_addr, bias_placeholder, True)
-    bias_placeholder[...] = 0
-
-    for b in nl.affine_range(batch):
-        weights_buffer = nl.ndarray(
-            (M, par_dim(pmax), head_dim),
-            dtype=weights.dtype,
-            buffer=nl.sbuf
-            
-        )
-        # sbuf_base_addr = update_base_addr(sbuf_base_addr, weights_buffer, True)
-        # Preload the entire weights tensor. everything fits in SBUF for LLaMA 3.1 70B
-        for m in nl.affine_range(M):
-            # weights_buffer[m, i_rhs.p, i_rhs.x] = nl.load(
-            #     weights[m * pmax + i_rhs.p, i_rhs.x],
-            #     mask=(m * pmax + i_rhs.p < dim) & (i_rhs.x < head_dim),
-            # )
-
-            i_weights = nl.mgrid[0:pmax, 0: N * fmax]
-            weights_buffer[m, i_weights.p, i_weights.x] = nl.load(weights[m * pmax + i_weights.p, i_weights.x],
-                                                    mask=(m*pmax+i_weights.p<dim) & (i_weights.x<head_dim))
-    
-        for i in nl.affine_range(TILES_INT):
-            # Double buffer the input tensor
-            in_bufs = nl.ndarray(
-                (hidden_buffer_degree, par_dim(pmax), dim),
-                dtype=hidden.dtype,
-                buffer=nl.sbuf,
-            )
-            # sbuf_base_addr = update_base_addr(sbuf_base_addr, in_bufs, True)
-            for i_interleave_grp in nl.affine_range(hidden_buffer_degree):
-                in_bufs[i_interleave_grp] = nl.load(
-                    hidden[
-                        b, (hidden_buffer_degree * i + i_interleave_grp) * pmax + ix, iy
-                    ],
-                    mask=(hidden_buffer_degree * i + i_interleave_grp) * pmax + ix
-                    < seqlen,
-                )
-                act = nl.ndarray(
-                    (par_dim(pmax), dim),
-                    dtype=norm_dtype,
-                    buffer=nl.sbuf,
-                )
-                # sbuf_base_addr = update_base_addr(sbuf_base_addr, act, True)
-
-                # Write the RMS and RMS Reciprocal tensors back out here, in-place
-                square_sum = nl.ndarray(
-                    (par_dim(pmax), 1),
-                    dtype=norm_dtype,
-                    buffer=nl.sbuf,
-                )
-                # sbuf_base_addr = update_base_addr(sbuf_base_addr, square_sum, True)
-
-                # Write the output of RMS and RMS^T (in-place) out to here
-                out_tile = nl.ndarray(
-                    (par_dim(pmax), dim),
-                    dtype=weights.dtype,
-                    buffer=nl.sbuf,
-                )
-                
-
-                # Store the final output tiles to here before sending back to DRAM
-                output_sbuf = nl.ndarray(
-                    (par_dim(pmax), fmax),
-                    dtype=weights.dtype,
-                    buffer=nl.sbuf,
-                )
-                # sbuf_base_addr = update_base_addr(sbuf_base_addr, output_sbuf, True)
-
-
-
-                act[...] = nisa.activation_reduce(
-                    op=nl.square,
-                    data=in_bufs[i_interleave_grp],
-                    reduce_op=np.add,
-                    reduce_res=square_sum[...],
-                    bias=bias_placeholder[...],
-                )
-                square_sum[...] = nisa.tensor_scalar(
-                    square_sum[...], np.multiply, scale, op1=np.add, operand1=eps
-                )
-                square_sum[...] = nisa.activation(
-                    op=nl.rsqrt, data=square_sum[...], bias=bias_placeholder[...]
-                )
-
-                # all PE array ops must output to FP32 on trn1 but must match input dtype in trn2
-                if nisa.get_nc_version() == nisa.nc_version.gen3:
-                    transpose_res_psum = nl.ndarray(
-                        (NUM_TRANSP_TILES, par_dim(pmax), 4 * pmax),
-                        dtype=weights.dtype,
-                        buffer=nl.psum,
-                    )  # FIXME: perf is better when all tiles are on bank 0?
-                else:
-                    transpose_res_psum = nl.ndarray(
-                        (NUM_TRANSP_TILES, par_dim(pmax), 4 * pmax),
-                        dtype=np.float32,
-                        buffer=nl.psum,
-                    )  # FIXME: perf is better when all tiles are on bank 0?
-
-                for m in nl.affine_range(NUM_TRANSP_TILES):
-                    # Perform (hidden .* RMS Reciprocal)^T in tiles of fmax (512)
-                    out_tile[i_rhs.p, m * fmax + i_rhs.x] = nl.multiply(
-                        in_bufs[i_interleave_grp, i_rhs.p, m * fmax + i_rhs.x],
-                        square_sum[...],
-                        dtype=weights.dtype,
-                    )
-                    
-                    out_tile[i_rhs.p, m * fmax + i_rhs.x] = nl.multiply(
-                        out_tile[i_rhs.p, m * fmax + i_rhs.x],
-                        gamma_bcast[i_rhs.p, m * fmax + i_rhs.x],
-                        dtype=weights.dtype,
-                    )
-
-                    TILES_IN_BLOCK = fmax // pmax
-                    for j in nl.affine_range(TILES_IN_BLOCK):
-                        transpose_res_psum[m, i_lhs.p, j * pmax + i_lhs.x] = (
-                            nisa.nc_matmul(
-                                out_tile[
-                                    i_lhs.p, (m * TILES_IN_BLOCK + j) * pmax + i_lhs.x
-                                ],
-                                identity_tensor[...],
-                                is_transpose=True,
-                            )
-                        )
-                    out_tile[i_rhs.p, m * TILES_IN_BLOCK * pmax + i_rhs.x] = nl.copy(
-                        transpose_res_psum[m], dtype=hidden.dtype
-                    )
-
-                # perform (RMSNorm(hidden)^T)^T @ wQKV  
-                for n in nl.sequential_range(N):
-                  
-                  res_psum = nl.ndarray(
-                      (par_dim(pmax), fmax), dtype=nl.float32, buffer=nl.psum
-                  )
-                  
-                  for m in nl.affine_range(M):
-                      res_psum += nisa.nc_matmul(
-                          out_tile[i_lhs.p, m * pmax + i_lhs.x],
-                          weights_buffer[m, i_rhs.p, n * fmax + i_rhs.x],
-                      )
-
-                  output_sbuf[...] = nl.copy(res_psum, dtype=out_tensor.dtype)
-                  nl.store(
-                      out_tensor[
-                          b,
-                          (hidden_buffer_degree * i + i_interleave_grp) * pmax + i_res.p,
-                          n * fmax + i_res.x,
-                      ],
-                      value=output_sbuf,
-                      mask=(
-                          (hidden_buffer_degree * i + i_interleave_grp) * pmax + i_res.p
-                          < seqlen
-                      )
-                      & (n * fmax + i_res.x < head_dim),
-                  )
-
-    return out_tensor
 
 
 @nki.jit
@@ -378,11 +112,10 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
     # Since we're not reducing across the first dimension
     # Tiles can be processed independently
 
-    for b in nl.affine_range(a_tensor.shape[0]):
-        for i in nl.affine_range(math.ceil(a_tensor.shape[1]/128)):
+    for b in range(a_tensor.shape[0]):
+        for i in range(math.ceil(a_tensor.shape[1]/128)):
             # Load input data from external memory to on-chip memory
             a_tile = nl.zeros([128, a_tensor.shape[2]], a_tensor.dtype)
-            # a_tile = nl.ndarray([128, a_tensor.shape[2]], a_tensor.dtype)
             a_tile[...] = nl.load(a_tensor[b, i * 128 + ix, iy], mask=(i * 128 + ix < num_rows))
 
             # Compute element-wise square of a_tensor
@@ -414,454 +147,6 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
     return out_tensor
 
 
-@nki.jit
-def nki_matmul_hoist_load_(lhsT, rhs):
-    B, K, M = lhsT.shape
-    K_, N = rhs.shape
-    result = nl.ndarray((B, M, N),dtype=lhsT.dtype, buffer=nl.shared_hbm)
-
-    TILE_M = nl.tile_size.gemm_stationary_fmax
-    TILE_K = nl.tile_size.pmax
-    TILE_N = nl.tile_size.gemm_moving_fmax
-
-    i_lhsT = nl.mgrid[0:TILE_K, 0:TILE_M]
-    i_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
-    i_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for b in nl.affine_range(B):
-        for m in nl.affine_range(M // TILE_M):
-            lhsT_tiles = nl.ndarray((K // TILE_K, nl.par_dim(TILE_K), TILE_M),
-                                    dtype=lhsT.dtype,
-                                    buffer=nl.sbuf)
-            
-            for k in nl.affine_range(K // TILE_K):
-                lhsT_tiles[k, i_lhsT.p, i_lhsT.x] = nl.load(lhsT[b, k * TILE_K + i_lhsT.p,
-                                                                m * TILE_M + i_lhsT.x])
-            for n in nl.affine_range(N // TILE_N):
-                rhs_tiles = nl.ndarray((K // TILE_K, nl.par_dim(TILE_K), TILE_N),
-                                    dtype=rhs.dtype,
-                                    buffer=nl.sbuf)
-                
-                for k in nl.affine_range(K // TILE_K):
-                    rhs_tiles[k, i_rhs.p, i_rhs.x] = nl.load(rhs[k * TILE_K + i_rhs.p,
-                                                                n * TILE_N + i_rhs.x])
-                
-                res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(K // TILE_K):
-                    res_psum[...] += nisa.nc_matmul(lhsT_tiles[k, i_lhsT.p, i_lhsT.x],
-                                            rhs_tiles[k, i_rhs.p, i_rhs.x]
-                                            )
-                res_sbuf = nl.copy(res_psum, dtype=result.dtype)
-                nl.store(result[b, m * TILE_M + i_res.p, n * TILE_N + i_res.x], value=res_sbuf)
-            
-        if M % TILE_M:
-            m = M // TILE_M
-            mod_m = M % TILE_M
-            if N // TILE_N: 
-                lhsT_tiles = nl.ndarray((K // TILE_K, nl.par_dim(TILE_K), mod_m),
-                                        dtype=lhsT.dtype,
-                                        buffer=nl.sbuf)
-                
-                for k in nl.affine_range(K // TILE_K):
-                    lhsT_tiles[k, 0:TILE_K, :] = nl.load(lhsT[b,  k * TILE_K: (k + 1) * TILE_K,
-                                                                    m * TILE_M:])
-                for n in nl.affine_range(N // TILE_N):
-                    rhs_tiles = nl.ndarray((K // TILE_K, nl.par_dim(TILE_K), TILE_N),
-                                        dtype=rhs.dtype,
-                                        buffer=nl.sbuf)
-                    
-                    for k in nl.affine_range(K // TILE_K):
-                        rhs_tiles[k, i_rhs.p, i_rhs.x] = nl.load(rhs[k * TILE_K + i_rhs.p,
-                                                                    n * TILE_N + i_rhs.x])
-                    
-                    res_psum = nl.zeros((mod_m, TILE_N), nl.float32, buffer=nl.psum)
-                    for k in nl.affine_range(K // TILE_K):
-                        res_psum[...] += nisa.nc_matmul(lhsT_tiles[k, 0:TILE_K, :],
-                                                rhs_tiles[k, i_rhs.p, i_rhs.x])
-                    res_sbuf = nl.copy(res_psum, dtype=result.dtype)
-                    nl.store(result[b, m * TILE_M:, n * TILE_N: (n + 1) * TILE_N], value=res_sbuf)
-            
-            else:
-                n = N // TILE_N
-                mod_n = N % TILE_N
-
-                lhsT_tiles = nl.ndarray((K // TILE_K, nl.par_dim(TILE_K), mod_m), dtype=lhsT.dtype, buffer=nl.sbuf)
-                for k in nl.affine_range(K // TILE_K):
-                    lhsT_tiles[k, 0:TILE_K, :] = nl.load(lhsT[b,  k * TILE_K: (k + 1) * TILE_K,
-                                                                    m * TILE_M:])
-                    
-                rhs_tiles = nl.ndarray((K // TILE_K, nl.par_dim(TILE_K), mod_n), dtype=rhs.dtype, buffer=nl.sbuf)
-                for k in nl.affine_range(K // TILE_K):
-                    rhs_tiles[k, 0:TILE_K, :] = nl.load(rhs[k * TILE_K: (k + 1) * TILE_K, 
-                                                                    n * TILE_N:])
-                
-                res_psum = nl.zeros((mod_m, mod_n), nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(K // TILE_K):
-                    res_psum[...] += nisa.nc_matmul(lhsT_tiles[k, 0:TILE_K, :], rhs_tiles[k,  0:TILE_K, :])
-                res_sbuf = nl.copy(res_psum, dtype=result.dtype)
-                
-                nl.store(result[b, m * TILE_M:, n * TILE_N: ], value=res_sbuf)
-
-    return result
-
-
-@nki.jit
-def nki_sinle_token_matmul_(total_input, weight):
-  B, S, H = total_input.shape
-  L, H = weight.shape
-  output_tensor = nl.ndarray((B, S, L), dtype=total_input.dtype, buffer=nl.shared_hbm)
-  
-  TILE_P = nl.tile_size.pmax
-  for b in nl.affine_range(B):
-    input_bcast = nl.load(total_input[b, :, :]).broadcast_to((TILE_P, H))
-    
-    for i in nl.affine_range(L // TILE_P):
-      weight_tile = nl.load(weight[i * TILE_P: (i + 1) * TILE_P, :])
-      dot_tensor = input_bcast * weight_tile
-      reduce_tensor = nisa.tensor_reduce(nl.add, dot_tensor, axis=[1])
-
-      nl.store(output_tensor[b, 0, i * TILE_P: (i + 1) * TILE_P],
-               value=reduce_tensor)
-  
-  return output_tensor
-
-
-@nki.jit
-def nki_matmul_fully_optimized_copy_(
-  lhsT, 
-  rhs,
-  TILES_IN_BLOCK_M=8,
-  TILES_IN_BLOCK_N=4,
-  TILES_IN_BLOCK_K=4,
-):
-  B, K, M = lhsT.shape # TODO: finish block implement and look through different weights shape
-  K_, N = rhs.shape
-  result = nl.ndarray((B, M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-
-  TILE_M = nl.tile_size.gemm_stationary_fmax
-  TILE_K = nl.tile_size.pmax
-  TILE_N = nl.tile_size.gemm_moving_fmax
-
-  BLOCK_M = TILE_M * TILES_IN_BLOCK_M
-  BLOCK_N = TILE_N * TILES_IN_BLOCK_N
-  BLOCK_K = TILE_K * TILES_IN_BLOCK_K
-  
-  # if M < BLOCK_M:
-  #   ones_matrix = np.ones((B, K, BLOCK_M - M ))
-  #   lhsT = np.concatenate((lhsT, ones_matrix), axis=-1)
-  #   M_old = M
-  #   M = BLOCK_M
-
-  
-  
-  assert M % BLOCK_M == 0
-  assert N % BLOCK_N == 0
-  assert K % BLOCK_K == 0
-
-#   NUM_BLOCK_M = M // BLOCK_M 
-#   NUM_BLOCK_N = N // BLOCK_N 
-#   NUM_BLOCK_K = K // BLOCK_K 
-  NUM_BLOCK_M = (M+BLOCK_M-1) // BLOCK_M
-  NUM_BLOCK_N = (N+BLOCK_N-1) // BLOCK_N
-  NUM_BLOCK_K = (K+BLOCK_K-1) // BLOCK_K
-  
-  for b in nl.affine_range(B):
-    for n in nl.affine_range(NUM_BLOCK_N):
-      result_tiles = nl.zeros((NUM_BLOCK_M, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N,
-                              nl.par_dim(TILE_M), TILE_N),
-                              dtype=lhsT.dtype, buffer=nl.sbuf)
-      
-      for k in nl.sequential_range(NUM_BLOCK_K):
-        i_rhs = nl.mgrid[0:TILE_K, 0:BLOCK_N]
-        rhs_tiles = nl.ndarray((TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_N),
-                                dtype=rhs.dtype, buffer=nl.sbuf)
-        
-        for bk_r in nl.affine_range(TILES_IN_BLOCK_K):
-          rhs_tiles[bk_r, i_rhs.p, i_rhs.x] = nl.load(
-            rhs[(TILES_IN_BLOCK_K * k + bk_r) * TILE_K + i_rhs.p,
-                                            BLOCK_N * n + i_rhs.x])
-        
-        for m in nl.affine_range(NUM_BLOCK_M):
-          i_lhsT = nl.mgrid[0:TILE_K, 0:BLOCK_M]
-          lhsT_tiles = nl.ndarray((TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_M), 
-                                  dtype=lhsT.dtype, buffer=nl.sbuf)
-          
-          for bk_l in nl.affine_range(TILES_IN_BLOCK_K):
-            lhsT_tiles[bk_l, i_lhsT.p, i_lhsT.x] = nl.load(lhsT[b, (TILES_IN_BLOCK_K * k + bk_l) * TILE_K + i_lhsT.p,
-                                                  BLOCK_M * m + i_lhsT.x])
-        
-          i_lhsT_mm = nl.mgrid[0:TILE_K, 0:TILE_M]
-          i_rhs_mm = nl.mgrid[0:TILE_K, 0:TILE_N]
-          i_res_mm = nl.mgrid[0:TILE_M, 0:TILE_N]
-          for bn in nl.affine_range(TILES_IN_BLOCK_N):
-            for bm in nl.affine_range(TILES_IN_BLOCK_M):
-              res_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-              
-              for bk in nl.affine_range(TILES_IN_BLOCK_K):
-                res_tile[...] += nisa.nc_matmul(
-                  lhsT_tiles[bk, i_lhsT_mm.p, bm * TILE_M + i_lhsT_mm.x],
-                  rhs_tiles[bk, i_rhs_mm.p, bn * TILE_N + i_rhs_mm.x]
-                )
-              
-              result_tiles[m, bm, bn, i_res_mm.p, i_res_mm.x] += res_tile[i_res_mm.p, i_res_mm.x]
-      
-      for m in nl.affine_range(NUM_BLOCK_M):
-        for bm in nl.affine_range(TILES_IN_BLOCK_M):
-          i_res = nl.mgrid[0:TILE_K, 0:TILE_N]
-          i_res_packed = nl.mgrid[0:TILE_K, 0:BLOCK_N]
-          result_packed = nl.ndarray((TILE_K, BLOCK_N), dtype=result_tiles.dtype, 
-                                      buffer=nl.sbuf)
-          
-          for bn in nl.affine_range(TILES_IN_BLOCK_N):
-            result_packed[i_res.p,
-                          bn * TILE_N + i_res.x] = nl.copy(result_tiles[m, bm, bn,
-                          i_res.p, i_res.x])
-            nl.store(result[b, (TILES_IN_BLOCK_M * m + bm) * TILE_K + i_res_packed.p,
-                            BLOCK_N * n + i_res_packed.x],
-                            value=result_packed[i_res_packed.p, i_res_packed.x])
-      
-
-
-
-
-  return result
-
-
-
-@nki.jit
-def nki_rmsnorm(hidden, gamma, hidden_buffer_degree=1, eps=1e-6):
-    """
-    Allocated kernel that computes RMSNorm(hidden). This kernel is designed to only handle fp16/bf16 tensor types.
-    Internally, normalizations are cast to fp32 to avoid NaN errors.
-
-    Args:
-        hidden (_type_): Input tensor of the attention block in BSH layout
-        eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
-    """
-    # Hidden should be in BSH layout.
-    batch, batchless_shape = hidden.shape[0], hidden.shape[1:]
-    seqlen, dim = batchless_shape
-    assert (
-        dim == gamma.shape[0]
-    ), f"gamma {gamma.shape} does not match with hidden {hidden.shape}"
-    # assert gamma.dtype == hidden.dtype, "Gamma must match hidden dtype"
-    assert dim <= 8192 and dim % 128 == 0, "Unsupported hidden dimension"
-
-    norm_dtype = nl.float32
-    # norm_dtype = hidden.dtype
-
-    out_tensor = nl.ndarray(
-        (batch, seqlen, dim), dtype=hidden.dtype, buffer=nl.shared_hbm
-    )
-
-    pmax = nl.tile_size.pmax  # 128
-    i_p = nl.arange(pmax)[:, None]
-    i_f = nl.arange(dim)[None, :]
-    i_w = nl.arange(1)[:, None]
-    NUM_TILES = math.ceil(seqlen / pmax)
-    TILES_INT = math.ceil(NUM_TILES / hidden_buffer_degree)
-    scale = 1 / dim
-
-    # Allocate broadcasted gamma buffer
-    gamma_bcast = nl.ndarray(
-        (par_dim(pmax), dim),
-        dtype=gamma.dtype,
-        buffer=nl.sbuf
-    )
-  
-    for i in nl.affine_range(pmax):
-        gamma_bcast[i, i_f] = nl.load(
-            gamma.reshape((1, dim))[i_w, i_f], dtype=gamma.dtype
-        )
-
-    for b in nl.affine_range(batch):
-        for i in nl.affine_range(TILES_INT):
-            # Buffer the input tensor
-            in_bufs = nl.zeros(
-                (hidden_buffer_degree, par_dim(pmax), dim),
-                dtype=hidden.dtype,
-                buffer=nl.sbuf
-            )
-           
-            for i_interleave_grp in nl.affine_range(hidden_buffer_degree):
-                seq_pos = (hidden_buffer_degree * i + i_interleave_grp) * pmax
-                mask = seq_pos + i_p < seqlen
-                in_bufs[i_interleave_grp] = nl.load(
-                    hidden[b, seq_pos + i_p, i_f],
-                    mask=mask,
-                )
-
-                # Write the RMS and RMS Reciprocal tensors back out here, in-place
-                square_sum = nl.ndarray(
-                    (par_dim(pmax), 1),
-                    dtype=norm_dtype,
-                    buffer=nl.sbuf,
-                )
-
-                ############################################################
-                act = nisa.activation_reduce(
-                    op=nl.square,
-                    data=in_bufs[i_interleave_grp],
-                    reduce_op=np.add,
-                    reduce_res=square_sum[...],
-
-                )
-
-                square_sum[...] = nisa.tensor_scalar(
-                    square_sum[...], np.multiply, scale, op1=np.add, operand1=eps
-                )
-                square_sum[...] = nisa.activation(
-                    op=nl.rsqrt, data=square_sum[...]
-                )
-
-                ########################################
-                # # Compute element-wise square of a_tensor
-                # in_square = nl.square(in_bufs[i_interleave_grp])
-
-                # # Calculate sum of squared elements, along last dimension
-                # square_sum = nl.sum(in_square, axis=[1])
-
-                # # Scale and get a reciprocal
-                # mean = square_sum / hidden.shape[2]
-
-                # # Take square root of mean and then reciprocal with
-                # # rsqrt API (one ISA instruction)
-                # square_sum[...]= nl.rsqrt(mean + eps)
-                ########################################
-
-
-
-                # # Apply normalization
-               
-                output_tile = nl.multiply(
-                    in_bufs[i_interleave_grp],
-                    square_sum[...],
-                    dtype=hidden.dtype,
-                )
-
-                # Multiply with the RMSNorm weight
-                output_tile[...] = nl.multiply(
-                    output_tile[...], gamma_bcast[...], mask=mask
-                )
-
-                # Store result
-                nl.store(
-                    out_tensor[b, seq_pos + i_p, i_f],
-                    value=output_tile,
-                    mask=mask,
-                )
-  
-    return out_tensor
-
-
-
-# @nki.jit(mode="torchxla")
-def nki_matmul(hidden, weight):
-
-    if hidden.shape[1] == 1:
-        output = nki_sinle_token_matmul_(hidden, weight)
-    else:
-        B, M, K = hidden.shape
-        N, K_ = weight.shape
-    
-
-        TILE_M = nl.tile_size.gemm_stationary_fmax
-        TILE_K = nl.tile_size.pmax
-        TILE_N = nl.tile_size.gemm_moving_fmax
-
-        TILES_IN_BLOCK_K=8
-        TILES_IN_BLOCK_M=1
-        if  N == 256:
-            output = nki_matmul_hoist_load_(hidden.transpose(1, 2), weight.t())
-        else:
-            if N == 512:
-                TILES_IN_BLOCK_N=1
-            elif N == 1024:
-                TILES_IN_BLOCK_N=2
-            # elif N == 1536:
-            #     TILES_IN_BLOCK_N=3
-            else:
-                TILES_IN_BLOCK_N=4
-            
-
-            BLOCK_M = TILE_M * TILES_IN_BLOCK_M
-            BLOCK_N = TILE_N * TILES_IN_BLOCK_N
-            BLOCK_K = TILE_K * TILES_IN_BLOCK_K
-
-            if M < BLOCK_M:
-                ones_matrix = torch.ones((B, BLOCK_M - M, K ), dtype=hidden.dtype, device=hidden.device)
-                hidden = torch.cat((hidden, ones_matrix), axis=1)
-            
-            if N % BLOCK_N:
-            # if N // BLOCK_N:
-                # n = N // BLOCK_N
-                # res = BLOCK_N * (n + 1) - N
-                res = BLOCK_N - (N % BLOCK_N)
-                ones_matrix = torch.ones((res, K ), dtype=hidden.dtype, device=hidden.device)
-                weight =  torch.cat((weight, ones_matrix), axis=0)
-            
-            output = nki_matmul_fully_optimized_copy_(hidden.transpose(1, 2), weight.t(),
-                                                        TILES_IN_BLOCK_M,TILES_IN_BLOCK_N,TILES_IN_BLOCK_K,
-                                                    )[:, :M, :N]
-    return output
-
-def nki_fuse_up_gate_matmul(hidden, gate_w, up_w):
-    
-    split_idx = up_w.shape[0]
-    weight=torch.cat((gate_w, up_w), dim=0)
-
-    if hidden.shape[1] == 1:
-        output = nki_sinle_token_matmul_(hidden, weight)
-    else:
-        B, M, K = hidden.shape
-        N, K_ = weight.shape
-    
-
-        TILE_M = nl.tile_size.gemm_stationary_fmax
-        TILE_K = nl.tile_size.pmax
-        TILE_N = nl.tile_size.gemm_moving_fmax
-
-        TILES_IN_BLOCK_K=8
-        TILES_IN_BLOCK_M=1
-        if  N == 256:
-            output = nki_matmul_hoist_load_(hidden.transpose(1, 2), weight.t())
-        else:
-            if N == 512:
-                TILES_IN_BLOCK_N=1
-            elif N == 1024:
-                TILES_IN_BLOCK_N=2
-            # elif N == 1536:
-            #     TILES_IN_BLOCK_N=3
-            else:
-                TILES_IN_BLOCK_N=4
-            
-
-            BLOCK_M = TILE_M * TILES_IN_BLOCK_M
-            BLOCK_N = TILE_N * TILES_IN_BLOCK_N
-            BLOCK_K = TILE_K * TILES_IN_BLOCK_K
-
-            if M < BLOCK_M:
-                ones_matrix = torch.ones((B, BLOCK_M - M, K ), dtype=hidden.dtype, device=hidden.device)
-                hidden = torch.cat((hidden, ones_matrix), axis=1)
-            
-            if N % BLOCK_N:
-            # if N // BLOCK_N:
-                # n = N // BLOCK_N
-                # res = BLOCK_N * (n + 1) - N
-                res = BLOCK_N - (N % BLOCK_N)
-                ones_matrix = torch.ones((res, K ), dtype=hidden.dtype, device=hidden.device)
-                weight =  torch.cat((weight, ones_matrix), axis=0)
-            
-            output = nki_matmul_fully_optimized_copy_(hidden.transpose(1, 2), weight.t(),
-                                                        TILES_IN_BLOCK_M,TILES_IN_BLOCK_N,TILES_IN_BLOCK_K,
-                                                    )[:, :M, :N]
-    
-
-           
-    gate_proj_output, up_proj_output = torch.split(output, split_idx, dim=2)
-    return gate_proj_output, up_proj_output
-
-
-
 class CustomRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6, nki_enabled=False):
         """
@@ -875,14 +160,7 @@ class CustomRMSNorm(nn.Module):
 
     def forward(self, hidden_states):
         if self.nki_enabled:
-            # original_dtype = hidden_states.dtype
-
-            # hidden_states = hidden_states.to(torch.float32)
-            # self.weight = self.weight.to(torch.float32)
-            # out_tensor = nki_rmsnorm_kernel(hidden_states, self.weight, self.variance_epsilon)
-            out_tensor = nki_rmsnorm(hidden=hidden_states, gamma=self.weight, eps=self.variance_epsilon)
-
-            # out_tensor = out_tensor.to(original_dtype)
+            out_tensor = nki_rmsnorm_kernel(hidden_states, self.weight, self.variance_epsilon)
             return out_tensor
 
         original_dtype = hidden_states.dtype
@@ -952,7 +230,6 @@ def convert_state_dict_to_fused_qkv(llama_state_dict, cfg: InferenceConfig):
 
     return llama_state_dict
 
-################ Config #######################
 
 class NeuronConfigNKI(NeuronConfig):
     def __init__(self, **kwargs):
@@ -987,674 +264,6 @@ class LlamaInferenceConfig(InferenceConfig):
     def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
         return NeuronConfigNKI
 
-################ Nki Class #######################
-
-
-class NkiLinearWithAsyncCommunication(LinearWithAsyncCommunication):
-    """Linear layer execution with asynchronous communication."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        bias: Optional[torch.Tensor],
-        async_grad_allreduce: bool,
-        sequence_parallel_enabled: bool,
-        sequence_dimension: Optional[int] = 0,
-        save_for_backward: bool = True,
-        process_group: Optional[ProcessGroup] = None,
-        reduce_dtype: torch.dtype = torch.float32,
-    ) -> torch.Tensor:
-        ctx.use_bias = bias is not None and weight.requires_grad
-        ctx.async_grad_allreduce = async_grad_allreduce
-        ctx.sequence_parallel_enabled = sequence_parallel_enabled
-        ctx.sequence_dimension = sequence_dimension
-        ctx.compute_weight_gradient = weight.requires_grad
-        if process_group is None:
-            process_group = get_tensor_model_parallel_group(as_list=True)
-        ctx.process_group = process_group
-        ctx.reduce_dtype = reduce_dtype
-
-        if ctx.sequence_parallel_enabled:
-            assert (
-                ctx.sequence_dimension is not None
-            ), "Found `sequence_parallel_enabled` set to True, but `sequence_dimension` was None, and this occured in an unexpected area"
-
-        if save_for_backward:
-            if ctx.compute_weight_gradient:
-                ctx.save_for_backward(input, weight)
-            else:
-                ctx.save_for_backward(weight)
-
-        if ctx.sequence_parallel_enabled:
-            # `input` is supposed to be 3D and the optimal order of dimension is [sequence, batch, hidden]
-            # If not SBH, the necessary transposes will be added
-            total_input = _gather_along_dim(input, ctx.sequence_dimension, process_group=ctx.process_group)
-        else:
-            total_input = input
-
-        import time 
-
-        # output = torch.einsum('...m,mn->...n', total_input, weight.t())
-        # output = torch.matmul(total_input, weight.t())
-        ######################################################
-
-        ##############################
-        
-        # if total_input.shape[1] == 1:
-        #     output = nki_sinle_token_matmul_(total_input, weight)
-        # else:
-        #     # output = nki_matmul_hoist_load_(total_input.transpose(1, 2), weight.t())
-        #     output = torch.einsum('...m,mn->...n', total_input, weight.t())
-        ##############################
-        
-        if total_input.shape[1] == 1:
-            output = nki_sinle_token_matmul_(total_input, weight)
-        else:
-            B, M, K = total_input.shape
-            N, K_ = weight.shape
-        
-
-            TILE_M = nl.tile_size.gemm_stationary_fmax
-            TILE_K = nl.tile_size.pmax
-            TILE_N = nl.tile_size.gemm_moving_fmax
-
-            TILES_IN_BLOCK_K=8
-            TILES_IN_BLOCK_M=1
-            if  N == 256:
-                output = nki_matmul_hoist_load_(total_input.transpose(1, 2), weight.t())
-            else:
-                if N == 512:
-                    TILES_IN_BLOCK_N=1
-                elif N == 1024:
-                    TILES_IN_BLOCK_N=2
-                # elif N == 1536:
-                #     TILES_IN_BLOCK_N=3
-                else:
-                    TILES_IN_BLOCK_N=4
-                
-
-                BLOCK_M = TILE_M * TILES_IN_BLOCK_M
-                BLOCK_N = TILE_N * TILES_IN_BLOCK_N
-                BLOCK_K = TILE_K * TILES_IN_BLOCK_K
-
-                if M < BLOCK_M:
-                    ones_matrix = torch.ones((B, BLOCK_M - M, K ), dtype=total_input.dtype, device=total_input.device)
-                    total_input = torch.cat((total_input, ones_matrix), axis=1)
-                
-                if N % BLOCK_N:
-                # if N // BLOCK_N:
-                    # n = N // BLOCK_N
-                    # res = BLOCK_N * (n + 1) - N
-                    res = BLOCK_N - (N % BLOCK_N)
-                    ones_matrix = torch.ones((res, K ), dtype=total_input.dtype, device=total_input.device)
-                    weight =  torch.cat((weight, ones_matrix), axis=0)
-                
-                output = nki_matmul_fully_optimized_copy_(total_input.transpose(1, 2), weight.t(),
-                                                            TILES_IN_BLOCK_M,TILES_IN_BLOCK_N,TILES_IN_BLOCK_K,
-                                                        )[:, :M, :N]
-
-
-        ###########################
-
-            # def custom_allclose(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float):
-            #     # equivalent to torch.allclose except rtol is multiplied by absolute max, not abs
-            #     # this matches the behavior of the compiler's birsim-to-xla_infergoldens verification
-            #     error = (torch.abs(a - b) - atol) / torch.max(torch.abs(b))
-            #     passed = torch.all(error <= rtol)
-            #     return passed.item(), torch.max(error).item()
-            
-            # passed, max_error =  custom_allclose(output, output2, atol=1e-05, rtol=0.05)
-            # assert passed, f"output != output2 {max_error}"
-
-            # output = torch.matmul(total_input, weight.t())
-            
-            # if torch.allclose(output1, output, atol=1e-4, rtol=1e-2):
-            #     print("output1 and output2 match")
-            # else:
-            #     print("output1 and output2 differ")
-        ###########################
-        if bias is not None:
-            output = output + bias
-        return output
-
-
-# class NKIMLPLinearWithAsyncCommunication(torch.autograd.Function):
-#     """Linear layer execution with asynchronous communication."""
-
-#     @staticmethod
-#     def forward(
-#         ctx,
-#         rmsnorm,
-#         input: torch.Tensor,
-#         weight: torch.Tensor,
-#         bias: Optional[torch.Tensor],
-#         async_grad_allreduce: bool,
-#         sequence_parallel_enabled: bool,
-#         sequence_dimension: Optional[int] = 0,
-#         save_for_backward: bool = True,
-#         process_group: Optional[ProcessGroup] = None,
-#         reduce_dtype: torch.dtype = torch.float32,
-        
-#     ) -> torch.Tensor:
-#         ctx.use_bias = bias is not None and weight.requires_grad
-#         ctx.async_grad_allreduce = async_grad_allreduce
-#         ctx.sequence_parallel_enabled = sequence_parallel_enabled
-#         ctx.sequence_dimension = sequence_dimension
-#         ctx.compute_weight_gradient = weight.requires_grad
-#         if process_group is None:
-#             process_group = get_tensor_model_parallel_group(as_list=True)
-#         ctx.process_group = process_group
-#         ctx.reduce_dtype = reduce_dtype
-
-#         if ctx.sequence_parallel_enabled:
-#             assert (
-#                 ctx.sequence_dimension is not None
-#             ), "Found `sequence_parallel_enabled` set to True, but `sequence_dimension` was None, and this occured in an unexpected area"
-
-#         if save_for_backward:
-#             if ctx.compute_weight_gradient:
-#                 ctx.save_for_backward(input, weight)
-#             else:
-#                 ctx.save_for_backward(weight)
-
-#         if ctx.sequence_parallel_enabled:
-#             # `input` is supposed to be 3D and the optimal order of dimension is [sequence, batch, hidden]
-#             # If not SBH, the necessary transposes will be added
-#             total_input = _gather_along_dim(input, ctx.sequence_dimension, process_group=ctx.process_group)
-#         else:
-#             total_input = input
-
-
-
-#         output = nki_fused_rms_norm_qkv(hidden=total_input, 
-#                                 gamma=rmsnorm.weight.unsqueeze(0),
-#                                 weights=weight.t(),
-#                                 hidden_buffer_degree=1,
-#                                 eps=rmsnorm.variance_epsilon)
-
-#         if bias is not None:
-#             output = output + bias
-#         return output
-
-class NkiLmLinearWithAsyncCommunication(LinearWithAsyncCommunication):
-    """Linear layer execution with asynchronous communication."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        bias: Optional[torch.Tensor],
-        async_grad_allreduce: bool,
-        sequence_parallel_enabled: bool,
-        sequence_dimension: Optional[int] = 0,
-        save_for_backward: bool = True,
-        process_group: Optional[ProcessGroup] = None,
-        reduce_dtype: torch.dtype = torch.float32,
-    ) -> torch.Tensor:
-        ctx.use_bias = bias is not None and weight.requires_grad
-        ctx.async_grad_allreduce = async_grad_allreduce
-        ctx.sequence_parallel_enabled = sequence_parallel_enabled
-        ctx.sequence_dimension = sequence_dimension
-        ctx.compute_weight_gradient = weight.requires_grad
-        if process_group is None:
-            process_group = get_tensor_model_parallel_group(as_list=True)
-        ctx.process_group = process_group
-        ctx.reduce_dtype = reduce_dtype
-
-        if ctx.sequence_parallel_enabled:
-            assert (
-                ctx.sequence_dimension is not None
-            ), "Found `sequence_parallel_enabled` set to True, but `sequence_dimension` was None, and this occured in an unexpected area"
-
-        if save_for_backward:
-            if ctx.compute_weight_gradient:
-                ctx.save_for_backward(input, weight)
-            else:
-                ctx.save_for_backward(weight)
-
-        if ctx.sequence_parallel_enabled:
-            # `input` is supposed to be 3D and the optimal order of dimension is [sequence, batch, hidden]
-            # If not SBH, the necessary transposes will be added
-            total_input = _gather_along_dim(input, ctx.sequence_dimension, process_group=ctx.process_group)
-        else:
-            total_input = input
-
-        import time 
-
-        # output = torch.einsum('...m,mn->...n', total_input, weight.t())
-        # output = torch.matmul(total_input, weight.t())
-        ######################################################
-        
-        if total_input.shape[1] == 1:
-            output = nki_sinle_token_matmul_(total_input, weight)
-        else:
-            B, M, K = total_input.shape
-            N, K_ = weight.shape
-        
-
-            TILE_M = nl.tile_size.gemm_stationary_fmax
-            TILE_K = nl.tile_size.pmax
-            TILE_N = nl.tile_size.gemm_moving_fmax
-
-            TILES_IN_BLOCK_K=8
-            TILES_IN_BLOCK_M=1
-            TILES_IN_BLOCK_N=8
-                
-
-            BLOCK_M = TILE_M * TILES_IN_BLOCK_M
-            BLOCK_N = TILE_N * TILES_IN_BLOCK_N
-            BLOCK_K = TILE_K * TILES_IN_BLOCK_K
-
-            if M < BLOCK_M:
-                ones_matrix = torch.ones((B, BLOCK_M - M, K ), dtype=total_input.dtype, device=total_input.device)
-                total_input = torch.cat((total_input, ones_matrix), axis=1)
-            
-            if N % BLOCK_N:
-            # if N // BLOCK_N:
-                # n = N // BLOCK_N
-                # res = BLOCK_N * (n + 1) - N
-                res = BLOCK_N - (N % BLOCK_N)
-                ones_matrix = torch.ones((res, K ), dtype=total_input.dtype, device=total_input.device)
-                weight =  torch.cat((weight, ones_matrix), axis=0)
-            
-            output = nki_matmul_fully_optimized_copy_(total_input.transpose(1, 2), weight.t(),
-                                                            TILES_IN_BLOCK_M,TILES_IN_BLOCK_N,TILES_IN_BLOCK_K,
-                                                        )[:, :M, :N]
-
-        if bias is not None:
-            output = output + bias
-        return output
-
-
-class NkiColumnParallelLinear(ColumnParallelLinear):
-
-    def forward(self, input: torch.Tensor, *_: Any) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Forward of ColumnParallelLinear
-
-        Args:
-            input_: 3D tensor whose order of dimension is [batch, sequence, hidden]
-
-        Returns:
-            - output
-        """
-        if self.pad and self.training:
-            raise RuntimeError("`pad=True` is only supported for inference. Set model.eval()")
-
-        if self.async_tensor_model_parallel_allreduce or self.sequence_parallel_enabled:
-            input_parallel = input
-        else:
-            input_parallel = copy_to_tensor_model_parallel_region(input, process_group=self.tensor_parallel_group)
-
-        # Matrix multiply.
-        output_parallel = self._forward_impl(
-            input=input_parallel, # torch.Size([1, 32, 2048])
-            weight=self.weight, # torch.Size([2048, 2048])
-            bias=None,
-            async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
-            sequence_parallel_enabled=self.sequence_parallel_enabled,
-            sequence_dimension=self.sequence_dimension,
-            autograd_func_class=NkiLinearWithAsyncCommunication,
-            process_group=self.tensor_parallel_group,
-            reduce_dtype = self.reduce_dtype,
-        )
-
-
-        if self.gather_output:
-            # All-gather across the partitions.
-            assert not self.sequence_parallel_enabled
-            output = gather_from_tensor_model_parallel_region(output_parallel, process_group=self.tensor_parallel_group)
-            if self.pad and self.pad_size > 0:
-                output = torch.narrow(output, -1, 0, self.output_size - self.pad_size)
-        else:
-            output = output_parallel
-        if self.skip_bias_add:
-            return output, self.bias
-        output = (output + self.bias) if self.bias is not None else output
-        return output
-
-
-class NkiLmColumnParallelLinear(ColumnParallelLinear):
-
-    def forward(self, input: torch.Tensor, *_: Any) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Forward of ColumnParallelLinear
-
-        Args:
-            input_: 3D tensor whose order of dimension is [batch, sequence, hidden]
-
-        Returns:
-            - output
-        """
-        if self.pad and self.training:
-            raise RuntimeError("`pad=True` is only supported for inference. Set model.eval()")
-
-        if self.async_tensor_model_parallel_allreduce or self.sequence_parallel_enabled:
-            input_parallel = input
-        else:
-            input_parallel = copy_to_tensor_model_parallel_region(input, process_group=self.tensor_parallel_group)
-
-        # Matrix multiply.
-        output_parallel = self._forward_impl(
-            input=input_parallel, # torch.Size([1, 32, 2048])
-            weight=self.weight, # torch.Size([2048, 2048])
-            bias=None,
-            async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
-            sequence_parallel_enabled=self.sequence_parallel_enabled,
-            sequence_dimension=self.sequence_dimension,
-            autograd_func_class=NkiLmLinearWithAsyncCommunication,
-            process_group=self.tensor_parallel_group,
-            reduce_dtype = self.reduce_dtype,
-        )
-
-
-        if self.gather_output:
-            # All-gather across the partitions.
-            assert not self.sequence_parallel_enabled
-            output = gather_from_tensor_model_parallel_region(output_parallel, process_group=self.tensor_parallel_group)
-            if self.pad and self.pad_size > 0:
-                output = torch.narrow(output, -1, 0, self.output_size - self.pad_size)
-        else:
-            output = output_parallel
-        if self.skip_bias_add:
-            return output, self.bias
-        output = (output + self.bias) if self.bias is not None else output
-        return output
-
-
-
-# def nki_linear_with_async_allreduce( 
-#     rmsnorm,
-#     input: torch.Tensor,
-#     weight: torch.Tensor,
-#     bias: Optional[torch.Tensor],
-#     async_grad_allreduce: bool,
-#     sequence_parallel_enabled: bool,
-#     sequence_dimension: Optional[int] = 0,
-#     autograd_func_class: Type[torch.autograd.Function] = LinearWithAsyncCommunication,
-#     save_for_backward: bool = True,
-#     process_group: Optional[ProcessGroup] = None,
-#     reduce_dtype: torch.dtype = torch.float32,
-# ) -> torch.Tensor:
-#     args = cast_if_autocast_enabled(
-#         rmsnorm,
-#         input,
-#         weight,
-#         bias,
-#         async_grad_allreduce,
-#         sequence_parallel_enabled,
-#         sequence_dimension,
-#         save_for_backward,
-#         process_group,
-#         reduce_dtype,
-        
-#     )
-#     verify_casted_dtype(args)
-#     with torch.cuda.amp.autocast(enabled=False):
-#         return autograd_func_class.apply(*args)
-
-
-
-# class NkiMlpColumnParallelLinear(ColumnParallelLinear):
-    # fuse rms norm and up / gate projection
-#     def __init__(
-#         self,
-#         input_size: int,
-#         output_size: int,
-#         bias: bool = True,
-#         gather_output: bool = True,
-#         dtype: torch.dtype = torch.float32,
-#         device: Optional[torch.device] = None,
-#         stride: int = 1,
-#         init_method: Optional[Callable[[Any], torch.Tensor]] = None,
-#         sequence_parallel_enabled: bool = False,
-#         sequence_dimension: Optional[int] = None,
-#         keep_master_weight: bool = False,
-#         skip_bias_add: bool = False,
-#         pad: bool = False,
-#         tensor_model_parallel_group: Optional[ProcessGroup] = None,
-#         reduce_dtype: torch.dtype = torch.float32,
-#     ):
-#         super().__init__(input_size=input_size,
-#                         output_size=output_size,
-#                         bias=bias,
-#                         gather_output= gather_output,
-#                         dtype= dtype,
-#                         device=device,
-#                         stride=stride,
-#                         init_method=init_method,
-#                         sequence_parallel_enabled=sequence_parallel_enabled,
-#                         sequence_dimension=sequence_dimension,
-#                         keep_master_weight=keep_master_weight,
-#                         skip_bias_add=skip_bias_add,
-#                         pad=pad,
-#                         tensor_model_parallel_group=tensor_model_parallel_group,
-#                         reduce_dtype=reduce_dtype,)
-
-    
-#         self._forward_impl = nki_linear_with_async_allreduce
-
-#     def forward(self, input: torch.Tensor, rmsnorm, *_: Any) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-#         """Forward of ColumnParallelLinear
-
-#         Args:
-#             input_: 3D tensor whose order of dimension is [batch, sequence, hidden]
-
-#         Returns:
-#             - output
-#         """
-#         if self.pad and self.training:
-#             raise RuntimeError("`pad=True` is only supported for inference. Set model.eval()")
-
-#         if self.async_tensor_model_parallel_allreduce or self.sequence_parallel_enabled:
-#             input_parallel = input
-#         else:
-#             input_parallel = copy_to_tensor_model_parallel_region(input, process_group=self.tensor_parallel_group)
-
-#         # Matrix multiply.
-#         output_parallel = self._forward_impl(
-#             input=input_parallel, # torch.Size([1, 32, 2048])
-#             weight=self.weight, # torch.Size([2048, 2048])
-#             bias=None,
-#             async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
-#             sequence_parallel_enabled=self.sequence_parallel_enabled,
-#             sequence_dimension=self.sequence_dimension,
-#             autograd_func_class=NKIMLPLinearWithAsyncCommunication,
-#             process_group=self.tensor_parallel_group,
-#             reduce_dtype = self.reduce_dtype,
-#             rmsnorm=rmsnorm
-#         )
-
-
-#         if self.gather_output:
-#             # All-gather across the partitions.
-#             assert not self.sequence_parallel_enabled
-#             output = gather_from_tensor_model_parallel_region(output_parallel, process_group=self.tensor_parallel_group)
-#             if self.pad and self.pad_size > 0:
-#                 output = torch.narrow(output, -1, 0, self.output_size - self.pad_size)
-#         else:
-#             output = output_parallel
-#         if self.skip_bias_add:
-#             return output, self.bias
-#         output = (output + self.bias) if self.bias is not None else output
-#         return output
-
-
-class NkiRowParallelLinear(RowParallelLinear):
-
-    def forward(self, input_: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Forward of RowParallelLinear
-
-        Args:
-            input_: 3D tensor whose order of dimension is [batch, sequence, hidden]
-
-        Returns:
-            - output
-        """
-        if self.pad and self.training:
-            raise RuntimeError("`pad=True` is only supported for inference. Set model.eval()")
-
-        # Set up backprop all-reduce.
-        if self.input_is_parallel:
-            input_parallel = input_
-        else:
-            if self.pad and self.pad_size > 0:
-                input_ = torch.nn.functional.pad(input_, (0, self.pad_size))
-            assert not self.sequence_parallel_enabled
-            input_parallel = scatter_to_tensor_model_parallel_region(input_, process_group=self.tensor_parallel_group)
-
-        # Matrix multiply.
-        output_ = self._forward_impl(
-            input=input_parallel,
-            weight=self.weight,
-            bias=None,
-            async_grad_allreduce=False,
-            sequence_parallel_enabled=False,
-            sequence_dimension=self.sequence_dimension,
-            autograd_func_class=NkiLinearWithAsyncCommunication,
-            process_group=self.tensor_parallel_group,
-            reduce_dtype = self.reduce_dtype,
-        )
-
-        if self.reduce_output:
-            # All-reduce across all the partitions.
-            original_dtype = output_.dtype
-
-            output_ = output_.to(self.reduce_dtype)
-
-            if self.sequence_parallel_enabled:
-                output_ = reduce_scatter_to_sequence_parallel_region(
-                    output_, self.sequence_dimension, process_group=self.tensor_parallel_group,
-                )
-            else:
-                output_ = reduce_from_tensor_model_parallel_region(
-                    output_, process_group=self.tensor_parallel_group,
-                )
-
-            output_ = output_.to(original_dtype)
-
-        if self.skip_bias_add:
-            return output_, self.bias
-        output = (output_ + self.bias) if self.bias is not None else output_
-        return output
-
-
-class NkiGroupQueryAttention_QKV(GroupQueryAttention_QKV):
-  
-    def _kernel_qkv_forward(self, hidden_states, fused_rmsnorm, rmsnorm):
-        logger.debug(
-            f"QKV kernel: fused_rmsnorm={fused_rmsnorm} logical_neuron_cores={self.logical_neuron_cores}"
-        )
-        bs, seqlen, h = hidden_states.shape
-
-        h2, fused_qkv_size = self.Wqkv.weight.shape
-        logger.debug(
-            f"fused QKV projection weight - shape: {self.Wqkv.weight.shape}, dtype: {self.Wqkv.weight.dtype}"
-        )
-
-        # shape checks
-        assert (
-            fused_qkv_size
-            == (self.num_attention_heads + 2 * self.num_key_value_heads)
-            * self.head_dim
-            // self.tp_degree
-        )
-        assert h == h2
-        ########################################################################
-        # QKV = torch.zeros(
-        #     bs,
-        #     seqlen,
-        #     fused_qkv_size,
-        #     dtype=hidden_states.dtype,
-        #     device=hidden_states.device,
-        # )
-
-        # grid = (vnc(self.logical_neuron_cores),)
-
-        # # the QKV kernel will automatically switch to the TKG QKV if seqlen==1
-        # _traced_qkv_kernel[grid](
-        #     hidden_states,
-        #     self.Wqkv.weight,
-        #     # unsqueeze so that shape of RMS gamma weight is [1, hidden] instead of [hidden]
-        #     # should be fine to pass this is as a dummy even if not using fused rmsnorm
-        #     rmsnorm.weight.unsqueeze(0)
-        #     if rmsnorm
-        #     else torch.ones((1, h), device=hidden_states.device),
-        #     QKV,
-        #     eps=self.rms_norm_eps,
-        #     kernel_name="QKV",
-        #     # Run RMSNorm inside the kernel if NOT using SP norm
-        #     fused_rmsnorm=(fused_rmsnorm and rmsnorm is not None),
-        # )
-        ########################################################################
-    
-        QKV = nki_fused_rms_norm_qkv(hidden=hidden_states, 
-                                gamma=rmsnorm.weight.unsqueeze(0),
-                                weights=self.Wqkv.weight,
-                                hidden_buffer_degree=1,
-                                eps=self.rms_norm_eps)
-        
-        ########################################################################
-        return self._split_fused_qkv(QKV)
-
-
-class NkiGroupQueryAttention_O(GroupQueryAttention_O):
-    def __init__(
-        self,
-        hidden_size: int,
-        head_dim: int,
-        num_attention_heads: int,
-        num_key_value_heads: int,
-        tp_degree: int = 1,
-        dtype: torch.dtype = torch.float32,
-        bias: bool = False,
-        desired_sharding_strategy: Optional[GQA] = None,
-        input_is_parallel: bool = False,
-        layer_name: str = "o_proj",
-        sequence_parallel_enabled: bool = False,
-        sequence_dimension: Optional[int] = None,
-        tensor_model_parallel_group: Optional[ProcessGroup] = None,
-        rpl_reduce_dtype: torch.dtype = None,
-    ):
-        super().__init__(
-        hidden_size=hidden_size,
-        head_dim=head_dim,
-        num_attention_heads=num_attention_heads,
-        num_key_value_heads=num_key_value_heads,
-        tp_degree=tp_degree,
-        dtype=dtype,
-        bias=bias,
-        desired_sharding_strategy=desired_sharding_strategy,
-        input_is_parallel=input_is_parallel,
-        layer_name=layer_name,
-        sequence_parallel_enabled=sequence_parallel_enabled,
-        sequence_dimension=sequence_dimension,
-        tensor_model_parallel_group=tensor_model_parallel_group,
-        rpl_reduce_dtype=rpl_reduce_dtype,
-        )
-
-
-        if self.tensor_model_parallel_group is not None:
-            self.o_proj = NkiRowParallelLinear(  
-                self.num_attention_heads * self.head_dim,
-                self.hidden_size,
-                bias=self.bias,
-                input_is_parallel=self.input_is_parallel,
-                dtype=self.dtype,
-                sequence_parallel_enabled=sequence_parallel_enabled,
-                sequence_dimension=sequence_dimension,
-                tensor_model_parallel_group=self.tensor_model_parallel_group,
-                reduce_dtype=rpl_reduce_dtype,
-            )
-        else:
-            self.o_proj = nn.Linear(
-                self.num_attention_heads * self.head_dim, self.hidden_size, bias=self.bias
-            )
-
-
-
-#########################  Neuron ######################### 
 
 class NeuronLlamaMLP(nn.Module):
     """
@@ -1728,7 +337,7 @@ class NeuronLlamaMLP(nn.Module):
                 )
 
             else:
-                self.gate_proj = NkiColumnParallelLinear(
+                self.gate_proj = ColumnParallelLinear(
                     self.hidden_size,
                     self.intermediate_size,
                     bias=mlp_bias,
@@ -1739,7 +348,7 @@ class NeuronLlamaMLP(nn.Module):
                     sequence_dimension=None,
                     tensor_model_parallel_group=get_tp_group(config),
                 )
-                self.up_proj = NkiColumnParallelLinear(
+                self.up_proj = ColumnParallelLinear(
                     self.hidden_size,
                     self.intermediate_size,
                     bias=mlp_bias,
@@ -1750,7 +359,7 @@ class NeuronLlamaMLP(nn.Module):
                     sequence_dimension=None,
                     tensor_model_parallel_group=get_tp_group(config),
                 )
-                self.down_proj = NkiRowParallelLinear(
+                self.down_proj = RowParallelLinear(
                     self.intermediate_size,
                     self.hidden_size,
                     bias=mlp_bias,
@@ -1968,7 +577,7 @@ class NeuronLlamaMLP(nn.Module):
             _mlp_fwd_call[grid](
                 x,  # attn_output
                 residual,  # hidden
-                ln_w,  # ln_w  # rmsnorm
+                ln_w,  # ln_w
                 gate_w,  # gate_w
                 up_w,  # up_w
                 down_w,  # down_w
@@ -2020,35 +629,19 @@ class NeuronLlamaMLP(nn.Module):
             )
 
         gate_proj_output = (
-            self.gate_proj(x, rmsnorm)
+            self.gate_proj(x)
             if not is_lora_module(self.gate_proj)
             else self.gate_proj(x, adapter_ids)
         )
-
         up_proj_output = (
-            self.up_proj(x, rmsnorm) if not is_lora_module(self.up_proj) else self.up_proj(x, adapter_ids)
+            self.up_proj(x) if not is_lora_module(self.up_proj) else self.up_proj(x, adapter_ids)
         )
-
         down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
-
         output = (
             self.down_proj(down_proj_input)
             if not is_lora_module(self.up_proj)
             else self.down_proj(down_proj_input, adapter_ids)
         )
-
-        #################
-        
-        # gate_proj_output = nki_matmul(x, self.gate_proj.weight)
-        # up_proj_output = nki_matmul(x, self.up_proj.weight)
-
-
-        # gate_proj_output, up_proj_output =nki_fuse_up_gate_matmul(x, self.gate_proj.weight, self.up_proj.weight)
-        # down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
-        # output = nki_matmul(down_proj_input, self.down_proj.weight)
-
-        #################
-        
         logger.debug(f"MLP output shape {output.shape}")
         return output
 
@@ -2124,60 +717,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
 
         self.init_rope()
 
-
-    def init_gqa_properties(self):
-        if (self.head_dim * self.num_attention_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_attention_heads})."
-            )
-
-        self.qkv_proj = NkiGroupQueryAttention_QKV(
-            hidden_size=self.hidden_size,
-            head_dim=self.head_dim,
-            num_attention_heads=self.num_attention_heads,
-            num_key_value_heads=self.num_key_value_heads,
-            tp_degree=self.tp_degree,
-            dtype=self.torch_dtype,
-            bias=self.bias,
-            gather_output=False,
-            fused_qkv=self.fused_qkv,
-            clip_qkv=self.clip_qkv,
-            sequence_parallel_enabled=self.sequence_parallel_enabled,
-            sequence_dimension=self.sequence_dimension,
-            tensor_model_parallel_group=self.tensor_model_parallel_group,
-            rms_norm_eps=self.rms_norm_eps,
-            qkv_kernel_enabled=self.neuron_config.qkv_kernel_enabled,
-            logical_neuron_cores=self.neuron_config.logical_neuron_cores,
-        )
-        self.o_proj = NkiGroupQueryAttention_O(
-            hidden_size=self.hidden_size,
-            head_dim=self.head_dim,
-            num_attention_heads=self.num_attention_heads,
-            num_key_value_heads=self.num_key_value_heads,
-            tp_degree=self.tp_degree,
-            dtype=self.torch_dtype,
-            bias=self.bias,
-            input_is_parallel=True,
-            layer_name=self.o_proj_layer_name,
-            sequence_parallel_enabled=self.sequence_parallel_enabled,
-            sequence_dimension=self.sequence_dimension,
-            tensor_model_parallel_group=self.tensor_model_parallel_group,
-            rpl_reduce_dtype=self.rpl_reduce_dtype,
-        )
-        self.num_heads = utils.divide(self.qkv_proj.get_num_attention_heads(), self.tp_degree)
-        self.num_key_value_heads = utils.divide(
-            self.qkv_proj.get_num_key_value_heads(), self.tp_degree
-        )
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        if self.qk_layernorm:
-            self.q_layernorm = nn.LayerNorm(self.head_dim)
-            self.k_layernorm = nn.LayerNorm(self.head_dim)
-        self.attn_kernel_enabled = self.neuron_config.attn_kernel_enabled
-        self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
-
-
-    def init_rope(self):  # rope: Rotary Position Embedding
+    def init_rope(self):
         if not hasattr(self.config, "rope_scaling") or self.config.rope_scaling is None:
             # TODO(yihsian): Check if we can just use our own implementation
             if self.is_medusa:
@@ -2236,22 +776,22 @@ class Llama3RotaryEmbedding(nn.Module):
         original_max_position_embeddings=8192,
     ):
         super().__init__()
-        self.dim = dim # 64
-        self.max_position_embeddings = max_position_embeddings # 131072 = 128 k
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
         self.base = base
         self.factor = factor
         self.low_freq_factor = low_freq_factor
         self.high_freq_factor = high_freq_factor
-        self.old_context_len = original_max_position_embeddings # 8192
+        self.old_context_len = original_max_position_embeddings
         self.register_buffer("inv_freq", None, persistent=False)
 
     @torch.no_grad()
     def forward(self, x, position_ids):
-        # x: [bs, num_attention_heads, seq_len, head_size] e.g.[1,8,32,64] x doesn't involve computation #TODO: sdh when position_len > self.old_context_len ?
+        # x: [bs, num_attention_heads, seq_len, head_size]
         if self.inv_freq is None:
             inv_freq = 1.0 / (
                 self.base
-                ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(x.device) / self.dim) 
+                ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(x.device) / self.dim)
             )
 
             low_freq_wavelen = self.old_context_len / self.low_freq_factor
@@ -2271,16 +811,17 @@ class Llama3RotaryEmbedding(nn.Module):
                     new_freqs.append((1 - smooth) * freq / self.factor + smooth * freq)
             self.inv_freq = torch.tensor(new_freqs, dtype=inv_freq.dtype, device=inv_freq.device)
 
-        inv_freq_expanded = (  #[1, 32, 1]
+        inv_freq_expanded = (
             self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         )
-        position_ids_expanded = position_ids[:, None, :].float() #[1, 1, 32]
+        position_ids_expanded = position_ids[:, None, :].float()
         with torch.autocast(device_type=x.device.type, enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2) #[1,32,32]
-            emb = torch.cat((freqs, freqs), dim=-1)#[1,32,64]
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos()
             sin = emb.sin()
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
 
 class NeuronLlamaDecoderLayer(nn.Module):
     """
@@ -2333,7 +874,6 @@ class NeuronLlamaDecoderLayer(nn.Module):
         # RMSNorm (fused with QKV kernel when SP is disabled)
         if (not self.qkv_kernel_enabled or self.sequence_parallel_enabled) and self.input_layernorm:
             hidden_states = self.input_layernorm(hidden_states)
-            
 
         # Self Attention
         hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
@@ -2374,6 +914,7 @@ class NeuronLlamaDecoderLayer(nn.Module):
         outputs = (hidden_states, present_key_value, cos_cache, sin_cache)
         return outputs
 
+
 class ResBlock(nn.Module):
     """
     A Residual Block module.
@@ -2404,6 +945,7 @@ class ResBlock(nn.Module):
             torch.Tensor: Output after the residual connection and activation.
         """
         return x + self.act(self.linear(x))
+
 
 class NeuronLlamaModel(NeuronBaseModel):
     """
@@ -2437,9 +979,9 @@ class NeuronLlamaModel(NeuronBaseModel):
                 use_spmd_rank=config.neuron_config.vocab_parallel,
             )
 
-            self.lm_head = NkiLmColumnParallelLinear(
-                config.hidden_size, # 2048
-                config.vocab_size,  #128256
+            self.lm_head = ColumnParallelLinear(
+                config.hidden_size,
+                config.vocab_size,
                 gather_output=not self.on_device_sampling,
                 bias=False,
                 pad=True,
@@ -2474,7 +1016,7 @@ class NeuronLlamaModel(NeuronBaseModel):
 
         if config.neuron_config.is_eagle_draft:
             fc_bias = getattr(config, "fc_bias", False)
-            self.fc = NkiColumnParallelLinear(
+            self.fc = ColumnParallelLinear(
                 config.hidden_size * 2, config.hidden_size, bias=fc_bias, gather_output=True
             )
         self.is_medusa = config.neuron_config.is_medusa
@@ -2483,7 +1025,7 @@ class NeuronLlamaModel(NeuronBaseModel):
 
         if self.is_medusa:
             if parallel_state.model_parallel_is_initialized():
-                medusa_head_cls = NkiColumnParallelLinear
+                medusa_head_cls = ColumnParallelLinear
             else:
                 medusa_head_cls = nn.Linear
             for i in range(self.num_medusa_heads):
@@ -2497,6 +1039,7 @@ class NeuronLlamaModel(NeuronBaseModel):
                     ),
                 )
                 setattr(self, f"medusa_head_{i}", medusa_head)
+
 
 class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
     """
