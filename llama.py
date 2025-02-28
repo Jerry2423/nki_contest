@@ -618,6 +618,27 @@ def nki_matmul_fully_optimized_copy_(
   K_, N = rhs.shape
   result = nl.ndarray((B, M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
+#   if K == 2048 and M == 128 and N == 2048:
+#       TILES_IN_BLOCK_M = 1
+#       TILES_IN_BLOCK_N = 4
+#       TILES_IN_BLOCK_K = 2
+#   elif K == 1024 and M == 128 and N == 2048:
+#       TILES_IN_BLOCK_M = 1
+#       TILES_IN_BLOCK_N = 2
+#       TILES_IN_BLOCK_K = 8
+#   elif K == 2048 and M == 128 and N == 4096:
+#       TILES_IN_BLOCK_M = 1
+#       TILES_IN_BLOCK_N = 4
+#       TILES_IN_BLOCK_K = 8
+#   elif K == 4096 and M == 128 and N == 2048:
+#       TILES_IN_BLOCK_M = 1
+#       TILES_IN_BLOCK_N = 4
+#       TILES_IN_BLOCK_K = 2
+#   elif M >= 2048:
+#         TILES_IN_BLOCK_M = 16
+#         TILES_IN_BLOCK_N = 2
+#         TILES_IN_BLOCK_K = 8
+
   TILE_M = nl.tile_size.gemm_stationary_fmax
   TILE_K = nl.tile_size.pmax
   TILE_N = nl.tile_size.gemm_moving_fmax
@@ -1236,14 +1257,40 @@ class NkiLinearWithAsyncCommunication(LinearWithAsyncCommunication):
             if  N == 256:
                 output = nki_matmul_hoist_load_(total_input.transpose(1, 2), weight.t())
             else:
+                # print(total_input.transpose(1, 2).shape, weight.t().shape)  
                 if N == 512:
                     TILES_IN_BLOCK_N=1
                 elif N == 1024:
                     TILES_IN_BLOCK_N=2
                 # elif N == 1536:
                 #     TILES_IN_BLOCK_N=3
-                else:
+                elif N == 2048:
                     TILES_IN_BLOCK_N=4
+                else:
+                    TILES_IN_BLOCK_N=8
+                
+                if K == 2048 and N == 2048:
+                    TILES_IN_BLOCK_N=4 
+                    TILES_IN_BLOCK_K=16
+                elif K == 1024 and N == 2048:
+                    TILES_IN_BLOCK_N=4
+                    TILES_IN_BLOCK_K=8
+                elif K == 2048 and N == 4096:
+                    TILES_IN_BLOCK_N=4
+                    TILES_IN_BLOCK_K=16
+                elif K == 4096 and N == 2048:
+                    TILES_IN_BLOCK_N=4
+                    TILES_IN_BLOCK_K=16
+
+                if M >= 2048:
+                    TILES_IN_BLOCK_M=16
+                    TILES_IN_BLOCK_N=2
+                    TILES_IN_BLOCK_K=8
+                
+                # if K == 2048:
+                #     TILES_IN_BLOCK_K=16
+                # elif K == 4096:
+                #     TILES_IN_BLOCK_K=32
                 
 
                 BLOCK_M = TILE_M * TILES_IN_BLOCK_M
@@ -1262,6 +1309,7 @@ class NkiLinearWithAsyncCommunication(LinearWithAsyncCommunication):
                     ones_matrix = torch.ones((res, K ), dtype=total_input.dtype, device=total_input.device)
                     weight =  torch.cat((weight, ones_matrix), axis=0)
                 
+                # print(BLOCK_K, total_input.transpose(1, 2).shape, weight.t().shape)
                 output = nki_matmul_fully_optimized_copy_(total_input.transpose(1, 2), weight.t(),
                                                             TILES_IN_BLOCK_M,TILES_IN_BLOCK_N,TILES_IN_BLOCK_K,
                                                         )[:, :M, :N]
