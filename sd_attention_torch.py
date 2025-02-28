@@ -9,7 +9,7 @@ Stable Diffusion Attention NKI kernel implementation.
 import torch
 from torch_xla.core import xla_model as xm
 
-from sd_attention_nki_kernels import fused_self_attn_for_SD_small_head_size
+from sd_attention_nki_kernels import fused_self_attn_for_SD_small_head_size_decode, fused_att_interface_decode
 
 
 if __name__ == "__main__":
@@ -28,13 +28,13 @@ if __name__ == "__main__":
 
       return torch.matmul(norm_score, v)
 
-  q_tensor = torch.rand((2, 4, 1, 64), dtype=torch.float32).to(device=device)
-  k_tensor = torch.rand((2, 4, 4096, 64), dtype=torch.float32).to(device=device)
-  v_tensor = torch.rand((2, 4, 4096, 64), dtype=torch.float32).to(device=device)
-  mask = torch.rand(1, 4096) < 0.5
+  q_tensor = torch.rand((2, 4, 1, 128), dtype=torch.float32).to(device=device)
+  k_tensor = torch.rand((2, 4, 4000, 128), dtype=torch.float32).to(device=device)
+  v_tensor = torch.rand((2, 4, 4000, 128), dtype=torch.float32).to(device=device)
+  mask = torch.rand(1, 4000) < 0.5
   mask = mask.to(device=device) 
 
-  output_nki = fused_self_attn_for_SD_small_head_size[2, 4](q_tensor, k_tensor, v_tensor, mask)
+  output_nki = fused_att_interface_decode(q_tensor, k_tensor, v_tensor, att_mask=mask.view(1, 1, 1, 4000))
 
   output_torch = cpu_golden_attn(q_tensor, k_tensor, v_tensor, mask)
 

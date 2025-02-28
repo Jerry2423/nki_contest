@@ -11,10 +11,11 @@ import neuronxcc.nki.isa as nisa
 import numpy as np
 import argparse
 from scipy.special import softmax
+import torch
 
 # NKI_EXAMPLE_31_BEGIN
 @nki.jit
-def fused_self_attn_for_SD_small_head_size(Q_ref, K_ref, V_ref, use_causal_mask=False,
+def fused_self_attn_for_SD_small_head_size_decode(Q_ref, K_ref, V_ref, use_causal_mask=False,
                                            mixed_precision=True, att_mask=None):
   """
   Fused self attention kernel for small head dimension Stable Diffusion workload, 
@@ -238,6 +239,52 @@ def fused_self_attn_for_SD_small_head_size(Q_ref, K_ref, V_ref, use_causal_mask=
   return out_ref
 # NKI_EXAMPLE_31_END
 
+def fused_att_interface_decode(Q, K, V, use_causal_mask=False, mixed_precision=True, att_mask=None):
+    B, H, Q_S, D = Q.shape
+    assert Q_S == 1, "Q sequence length must be 1"
+    S = K.shape[2]
+    assert K.shape == V.shape == (B, H, S, D), f"K/V shape mismatch! Expected {(B, H, S, D)}, got K:{K.shape}, V:{V.shape}"
+    
+    S_padded = ((S + 127) // 128) * 128  
+    padding_needed = S_padded - S
+    
+    K = torch.nn.functional.pad(K, (0, 0, 0, padding_needed))  # (B, H, S_padded, D)
+    V = torch.nn.functional.pad(V, (0, 0, 0, padding_needed))  # (B, H, S_padded, D)
+    
+    if att_mask is not None:
+        assert att_mask.shape == (1, 1, 1, S), f"Mask shape {att_mask.shape} should be (1,1,1,{S})"
+        pad_mask = torch.zeros((1, 1, 1, S_padded), dtype=torch.bool, device=Q.device)
+        pad_mask[:, :, :, :S] = att_mask  # 仅填充有效区域
+    else:
+        pad_mask = torch.zeros((1, 1, 1, S_padded), dtype=torch.bool, device=Q.device)
+        pad_mask[:, :, :, :S] = True
+    
+    if S_padded > 2**14:
+        chunk_size = 2**14
+        K_chunks = torch.split(K, chunk_size, dim=2)
+        V_chunks = torch.split(V, chunk_size, dim=2)
+        mask_chunks = torch.split(pad_mask, chunk_size, dim=-1)
+        
+        outputs = []
+        for k_chunk, v_chunk, mask_chunk in zip(K_chunks, V_chunks, mask_chunks):
+            chunk_output = fused_self_attn_for_SD_small_head_size_decode[B,H](
+                Q,          # (B,H,1,D)
+                k_chunk,    # (B,H,chunk_size,D)
+                v_chunk,    # (B,H,chunk_size,D)
+                use_causal_mask,
+                mixed_precision,
+                mask_chunk  # (1,1,1,chunk_size)
+            )
+            outputs.append(chunk_output)
+        
+        return torch.cat(outputs, dim=2)[:, :, :S, :]
+    else:
+        return fused_self_attn_for_SD_small_head_size_decode[B,H](
+            Q, K, V, 
+            use_causal_mask, 
+            mixed_precision, 
+            pad_mask.view(1, S_padded)
+        )[:, :, :S, :]
 
 def parse_args():
   parser = argparse.ArgumentParser("Run Stable Diffusion Attention NKI kernel.")
@@ -278,7 +325,7 @@ if __name__ == "__main__":
   output_golden = cpu_golden_attn(q_tensor, k_tensor, v_tensor)
 
   if args.mode == "accuracy":
-    output_nki = fused_self_attn_for_SD_small_head_size(q_tensor, k_tensor, v_tensor)
+    output_nki = fused_self_attn_for_SD_small_head_size_decode(q_tensor, k_tensor, v_tensor)
     print(f"NKI output: {output_nki}")
     print(f"Golden output: {output_golden}")
     allclose = np.allclose(output_nki, output_golden, atol=1e-5, rtol=1e-3)
@@ -286,7 +333,7 @@ if __name__ == "__main__":
     assert allclose, "Accuracy check fails!"
 
   else:
-    benchmark_func = nki.benchmark(fused_self_attn_for_SD_small_head_size,
+    benchmark_func = nki.benchmark(fused_self_attn_for_SD_small_head_size_decode,
                                    save_neff_name='file.neff',
                                    save_trace_name='profile.ntff')
     benchmark_func(q_tensor, k_tensor, v_tensor)

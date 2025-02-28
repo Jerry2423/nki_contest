@@ -2788,16 +2788,6 @@ def fused_att_interface(Q, K, V, use_causal_mask=False, mixed_precision=True, at
   assert K.shape == V.shape == (B, H, S, D), 'Input shape mismatch!'
   if att_mask is not None:
     assert att_mask.shape == (S, S), 'Attention mask shape mismatch!'
-#   if S < 128:
-#     softmax_scale = 1.0 / math.sqrt(D)
-#     q_scaled = Q * softmax_scale
-#     raw_score = torch.matmul(q_scaled, K.transpose(3, 2))
-#     if att_mask is not None:
-#       raw_score = torch.where(att_mask, raw_score, -9984.0)
-    
-#     norm_score = torch.nn.functional.softmax(raw_score, dim=-1)
-
-#     return torch.matmul(norm_score, V)
 
   S_padded = ((S + 127) // 128) * 128  
   padding_needed = S_padded - S  
