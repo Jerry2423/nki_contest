@@ -14,7 +14,7 @@ from scipy.special import softmax
 
 # NKI_EXAMPLE_31_BEGIN
 @nki.jit
-def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=False,
+def fused_self_attn_for_SD_small_head_size(Q_ref, K_ref, V_ref, use_causal_mask=False,
                                            mixed_precision=True, att_mask=None):
   """
   Fused self attention kernel for small head dimension Stable Diffusion workload, 
@@ -33,6 +33,7 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
    - k_ptr: shape   (seq_k, d_head)
    - v_ptr: shape   (seq_v, d_head)
    - out_ptr: shape (seq_q, d_head)
+   - mask: shape    (1, seq_k) (optional)
    - We use seq_q and seq_k and seq_v just for clarity, this kernel requires 
    seq_k == seq_v
 
@@ -44,6 +45,13 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
   """
   # Use q_ref dtype as the intermediate tensor dtype
   # Assume all IO tensors have the same dtype
+  b_i = nl.program_id(0)
+  h_i = nl.program_id(1)
+  
+  q_ref = Q_ref[b_i, h_i]
+  k_ref = K_ref[b_i, h_i]
+  v_ref = V_ref[b_i, h_i]
+  
   kernel_dtype = q_ref.dtype
   pe_in_dt = nl.bfloat16 if mixed_precision else np.float32
   assert q_ref.dtype == k_ref.dtype == v_ref.dtype
@@ -55,7 +63,14 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
   assert tuple(k_ref.shape) == (seqlen, d_head), 'Input shape mismatch!'
   assert tuple(v_ref.shape) == (seqlen,d_head), \
   f'Input shape mismatch! Expected: {(seqlen, d_head)} Actual: {tuple(v_ref.shape)}'
-  out_ref = nl.ndarray((1, d_head), dtype=q_ref.dtype, buffer=nl.shared_hbm)
+  B_sz = Q_ref.shape[0]
+  H_sz = Q_ref.shape[1]
+  assert B_sz == K_ref.shape[0] == V_ref.shape[0], 'Batch size mismatch!'
+  assert H_sz == K_ref.shape[1] == V_ref.shape[1], 'Head size mismatch!'
+  out_ref = nl.ndarray((B_sz, H_sz ,1, d_head), dtype=q_ref.dtype, buffer=nl.shared_hbm)
+
+  if att_mask is not None:
+    assert att_mask.shape == (1, seqlen), 'Attention mask shape mismatch!'
 
   # Softmax scaling factor, multiplied onto Q
   softmax_scale = 1 / np.sqrt(d_head)
@@ -217,7 +232,7 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
     attn_res_div = attn_res_sbuf * nisa.nc_transpose(sum_divisor[ip_sum_res, if_sum_res])
 
     nl.store(
-      out_ref[i_q_seq_tile * q_seq_tile_size + if_out, ip_out],
+      out_ref[b_i, h_i ,i_q_seq_tile * q_seq_tile_size + if_out, ip_out],
       value=attn_res_div)
 
   return out_ref

@@ -19,7 +19,7 @@ if __name__ == "__main__":
   def cpu_golden_attn(q, k, v, mask=None):
       softmax_scale = 1 / (q.size(-1) ** 0.5)
       q_scaled = q * softmax_scale
-      raw_score = torch.matmul(q_scaled, k.transpose(1, 0))
+      raw_score = torch.matmul(q_scaled, k.transpose(-1, -2))
 
       if mask is not None:
         raw_score = raw_score.masked_fill(~mask, -9984.0)
@@ -28,13 +28,13 @@ if __name__ == "__main__":
 
       return torch.matmul(norm_score, v)
 
-  q_tensor = torch.rand((1, 64), dtype=torch.float32).to(device=device)
-  k_tensor = torch.rand((4096, 64), dtype=torch.float32).to(device=device)
-  v_tensor = torch.rand((4096, 64), dtype=torch.float32).to(device=device)
+  q_tensor = torch.rand((2, 4, 1, 64), dtype=torch.float32).to(device=device)
+  k_tensor = torch.rand((2, 4, 4096, 64), dtype=torch.float32).to(device=device)
+  v_tensor = torch.rand((2, 4, 4096, 64), dtype=torch.float32).to(device=device)
   mask = torch.rand(1, 4096) < 0.5
   mask = mask.to(device=device) 
 
-  output_nki = fused_self_attn_for_SD_small_head_size(q_tensor, k_tensor, v_tensor, mask)
+  output_nki = fused_self_attn_for_SD_small_head_size[2, 4](q_tensor, k_tensor, v_tensor, mask)
 
   output_torch = cpu_golden_attn(q_tensor, k_tensor, v_tensor, mask)
 
