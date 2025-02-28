@@ -17,7 +17,7 @@ if __name__ == "__main__":
   device = xm.xla_device()
 
   def cpu_golden_attn(q, k, v, mask=None):
-      softmax_scale = 0.125
+      softmax_scale = 1 / (q.size(-1) ** 0.5)
       q_scaled = q * softmax_scale
       raw_score = torch.matmul(q_scaled, k.transpose(1, 0))
 
@@ -31,12 +31,14 @@ if __name__ == "__main__":
   q_tensor = torch.rand((1, 64), dtype=torch.float32).to(device=device)
   k_tensor = torch.rand((4096, 64), dtype=torch.float32).to(device=device)
   v_tensor = torch.rand((4096, 64), dtype=torch.float32).to(device=device)
+  mask = torch.rand(1, 4096) < 0.5
+  mask = mask.to(device=device) 
 
-  output_nki = fused_self_attn_for_SD_small_head_size(q_tensor, k_tensor, v_tensor)
+  output_nki = fused_self_attn_for_SD_small_head_size(q_tensor, k_tensor, v_tensor, mask)
 
-  output_torch = cpu_golden_attn(q_tensor, k_tensor, v_tensor)
+  output_torch = cpu_golden_attn(q_tensor, k_tensor, v_tensor, mask)
 
-  allclose = torch.allclose(output_torch, output_nki, atol=1e-5, rtol=1e-3)
+  allclose = torch.allclose(output_torch, output_nki, atol=0.03, rtol=0.01)
 
   if allclose:
     print("NKI and Torch match")

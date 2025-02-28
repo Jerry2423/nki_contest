@@ -15,7 +15,7 @@ from scipy.special import softmax
 # NKI_EXAMPLE_31_BEGIN
 @nki.jit
 def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=False,
-                                           mixed_precision=True):
+                                           mixed_precision=True, att_mask=None):
   """
   Fused self attention kernel for small head dimension Stable Diffusion workload, 
   simplified for this tutorial. 
@@ -58,7 +58,7 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
   out_ref = nl.ndarray((1, d_head), dtype=q_ref.dtype, buffer=nl.shared_hbm)
 
   # Softmax scaling factor, multiplied onto Q
-  softmax_scale = 0.125
+  softmax_scale = 1 / np.sqrt(d_head)
 
   q_seq_n_tiles, q_seq_tile_size = 1 // 1, 1
   k_seq_n_tiles, k_seq_tile_size = seqlen // 128, 128
@@ -128,15 +128,23 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
       ###################################
       # Step 3. Apply optional causal mask
       ###################################
-      if use_causal_mask:
-        # Magic number -9984.0 to replace -inf similar to what neuronx-cc uses
-        qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nisa.affine_select(
-          pred=(i_q_seq_tile * q_seq_tile_size + ip_qk >= i_k_seq_tile * k_seq_tile_size + if_qk),
-          on_true_tile=qk_psum[ip_qk, if_qk], on_false_value=-9984.0, dtype=kernel_dtype)
+      # if use_causal_mask:
+      #   # Magic number -9984.0 to replace -inf similar to what neuronx-cc uses
+      #   qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nisa.affine_select(
+      #     pred=(i_q_seq_tile * q_seq_tile_size + ip_qk >= i_k_seq_tile * k_seq_tile_size + if_qk),
+      #     on_true_tile=qk_psum[ip_qk, if_qk], on_false_value=-9984.0, dtype=kernel_dtype)
+      # else:
+      #   # Simply send psum result back to sbuf
+      #   qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.copy(qk_psum[ip_qk, if_qk],
+      #                                                                         dtype=kernel_dtype)
+
+      if att_mask is not None:
+        mask_sbuf = nl.load(att_mask[i_q_seq_tile * q_seq_tile_size + ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk], dtype=att_mask.dtype)
+        qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.where(mask_sbuf, qk_psum[ip_qk, if_qk], -9984.0, dtype=kernel_dtype)
       else:
-        # Simply send psum result back to sbuf
-        qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.copy(qk_psum[ip_qk, if_qk],
-                                                                              dtype=kernel_dtype)
+        qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.copy(qk_psum[ip_qk, if_qk], dtype=kernel_dtype)
+
+
 
       ###################################
       # Step 4. Softmax
