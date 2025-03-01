@@ -18,6 +18,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch LLaMA model for NXD inference."""
+
+########################################################
+
+# command: python --mode evaluate --fused-qkv
+# prompts = ["I believe the meaning of life is"]
+# results: 
+# Benchmark completed and its result is as following
+# {
+#     "e2e_model": {
+#         "latency_ms_p50": 282.39619731903076,
+#         "latency_ms_p90": 288.293981552124,
+#         "latency_ms_p95": 292.54584312438965,
+#         "latency_ms_p99": 293.65187644958496,
+#         "latency_ms_p100": 293.9283847808838,
+#         "latency_ms_avg": 282.977557182312,
+#         "throughput": 226.1663456185932
+#     },
+#     "context_encoding_model": {
+#         "latency_ms_p50": 27.979016304016113,
+#         "latency_ms_p90": 28.334927558898926,
+#         "latency_ms_p95": 28.338372707366943,
+#         "latency_ms_p99": 28.34833860397339,
+#         "latency_ms_p100": 28.350830078125,
+#         "latency_ms_avg": 28.06878089904785,
+#         "throughput": 1140.056638551249
+#     },
+#     "token_generation_model": {
+#         "latency_ms_p50": 6.625533103942871,
+#         "latency_ms_p90": 6.910085678100586,
+#         "latency_ms_p95": 6.943941116333008,
+#         "latency_ms_p99": 7.375626564025878,
+#         "latency_ms_p100": 7.453441619873047,
+#         "latency_ms_avg": 6.702198520783455,
+#         "throughput": 154.0178288236474
+#     }
+# }
+# Completed saving result to benchmark_report.json
+# Final Score: 1.5032075988902478
+#         Accuracy: True
+#         Latency: 293.65187644958496
+#         Throughput: 226.1663456185932
+#         NKI FLOPs Ratio: 0.9885663150025485
+
+########################################################
+
+
+
 import copy
 import gc
 import logging
@@ -597,13 +644,39 @@ def nki_sinle_token_matmul_(total_input, weight):
     
     for i in nl.affine_range(L // TILE_P):
       weight_tile = nl.load(weight[i * TILE_P: (i + 1) * TILE_P, :])
-      dot_tensor = input_bcast * weight_tile
+    #   dot_tensor = input_bcast * weight_tile
+      dot_tensor = nisa.tensor_tensor(input_bcast, weight_tile, op=nl.multiply)
       reduce_tensor = nisa.tensor_reduce(nl.add, dot_tensor, axis=[1])
 
       nl.store(output_tensor[b, 0, i * TILE_P: (i + 1) * TILE_P],
                value=reduce_tensor)
   
   return output_tensor
+
+
+# @nki.jit
+# def nki_sinle_token_matmul_2(total_input_T, weight_T):
+#   B, H, S = total_input_T.shape
+#   H, L = weight_T.shape
+#   output_tensor = nl.ndarray((B, S, L), dtype=total_input_T.dtype, buffer=nl.shared_hbm)
+  
+#   TILE_P = nl.tile_size.pmax
+#   for b in nl.affine_range(B):
+    
+#     temp_sum = nl.zeros((TILE_P, L), dtype=total_input_T.dtype, buffer=nl.sbuf)
+#     for i in nl.affine_range(H // TILE_P):
+#       input_bcast = nl.load(total_input_T[b, i * TILE_P: (i + 1) * TILE_P, :])
+#       weight_tile = nl.load(weight_T[i * TILE_P: (i + 1) * TILE_P, :])
+#       dot_tensor = nisa.tensor_scalar(weight_tile, op0=nl.multiply, operand0=input_bcast)
+#       temp_sum += dot_tensor
+#     for i in nl.affine_range(L // TILE_P):
+#       temp_sum_transpose = nisa.nc_transpose(temp_sum[:, i * TILE_P: (i + 1) * TILE_P], engine=nisa.vector_engine)
+#       reduce_tensor = nisa.tensor_reduce(nl.add, temp_sum_transpose, axis=[1])
+
+#       nl.store(output_tensor[b, 0, i * TILE_P: (i + 1) * TILE_P],
+#                value=reduce_tensor)
+  
+#   return output_tensor
 
 
 @nki.jit
@@ -617,27 +690,6 @@ def nki_matmul_fully_optimized_copy_(
   B, K, M = lhsT.shape # TODO: finish block implement and look through different weights shape
   K_, N = rhs.shape
   result = nl.ndarray((B, M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-
-#   if K == 2048 and M == 128 and N == 2048:
-#       TILES_IN_BLOCK_M = 1
-#       TILES_IN_BLOCK_N = 4
-#       TILES_IN_BLOCK_K = 2
-#   elif K == 1024 and M == 128 and N == 2048:
-#       TILES_IN_BLOCK_M = 1
-#       TILES_IN_BLOCK_N = 2
-#       TILES_IN_BLOCK_K = 8
-#   elif K == 2048 and M == 128 and N == 4096:
-#       TILES_IN_BLOCK_M = 1
-#       TILES_IN_BLOCK_N = 4
-#       TILES_IN_BLOCK_K = 8
-#   elif K == 4096 and M == 128 and N == 2048:
-#       TILES_IN_BLOCK_M = 1
-#       TILES_IN_BLOCK_N = 4
-#       TILES_IN_BLOCK_K = 2
-#   elif M >= 2048:
-#         TILES_IN_BLOCK_M = 16
-#         TILES_IN_BLOCK_N = 2
-#         TILES_IN_BLOCK_K = 8
 
   TILE_M = nl.tile_size.gemm_stationary_fmax
   TILE_K = nl.tile_size.pmax
@@ -761,16 +813,20 @@ def nki_rmsnorm(hidden, gamma, hidden_buffer_degree=1, eps=1e-6):
     scale = 1 / dim
 
     # Allocate broadcasted gamma buffer
-    gamma_bcast = nl.ndarray(
-        (par_dim(pmax), dim),
-        dtype=gamma.dtype,
-        buffer=nl.sbuf
-    )
+    gamma_bcast = nl.load(
+            gamma.reshape((1, dim))
+        ).broadcast_to((pmax, dim))
+    
+    # nl.ndarray(
+    #     (par_dim(pmax), dim),
+    #     dtype=gamma.dtype,
+    #     buffer=nl.sbuf
+    # )
   
-    for i in nl.affine_range(pmax):
-        gamma_bcast[i, i_f] = nl.load(
-            gamma.reshape((1, dim))[i_w, i_f], dtype=gamma.dtype
-        )
+    # for i in nl.affine_range(pmax):
+    #     gamma_bcast[i, i_f] = nl.load(
+    #         gamma.reshape((1, dim))[i_w, i_f], dtype=gamma.dtype
+    #     )
 
     for b in nl.affine_range(batch):
         for i in nl.affine_range(TILES_INT):
@@ -929,7 +985,9 @@ def nki_rmsnorm_single_token(hidden, gamma, hidden_buffer_degree=1, eps=1e-6):
 def nki_matmul(hidden, weight):
 
     if hidden.shape[1] == 1:
-        output = nki_sinle_token_matmul_(hidden, weight)
+        # output = nki_sinle_token_matmul_(hidden, weight)
+        output = torch.einsum('...m,mn->...n', hidden, weight.t())
+    
     else:
         B, M, K = hidden.shape
         N, K_ = weight.shape
@@ -981,7 +1039,8 @@ def nki_fuse_up_gate_matmul(hidden, gate_w, up_w):
     weight=torch.cat((gate_w, up_w), dim=0)
 
     if hidden.shape[1] == 1:
-        output = nki_sinle_token_matmul_(hidden, weight)
+        # output = nki_sinle_token_matmul_(hidden, weight)
+        output = torch.einsum('...m,mn->...n', hidden, weight.t())
     else:
         B, M, K = hidden.shape
         N, K_ = weight.shape
@@ -1048,14 +1107,14 @@ class CustomRMSNorm(nn.Module):
         if self.nki_enabled:
 
             if hidden_states.shape[1] == 1:  # token generation
-                # out_tensor = nki_rmsnorm_single_token(hidden=hidden_states, gamma=self.weight, eps=self.variance_epsilon)
+                out_tensor = nki_rmsnorm_single_token(hidden=hidden_states, gamma=self.weight, eps=self.variance_epsilon)
                 
-                original_dtype = hidden_states.dtype
-                hidden_states = hidden_states.to(torch.float32)
-                out_tensor = RmsNorm.apply(
-                    hidden_states, self.weight, self.variance_epsilon, len(hidden_states.shape) - 1
-                )
-                out_tensor = out_tensor.to(original_dtype)
+                # original_dtype = hidden_states.dtype
+                # hidden_states = hidden_states.to(torch.float32)
+                # out_tensor = RmsNorm.apply(
+                #     hidden_states, self.weight, self.variance_epsilon, len(hidden_states.shape) - 1
+                # )
+                # out_tensor = out_tensor.to(original_dtype)
             
             else:
                 out_tensor = nki_rmsnorm(hidden=hidden_states, gamma=self.weight, eps=self.variance_epsilon)
@@ -1242,6 +1301,7 @@ class NkiLinearWithAsyncCommunication(LinearWithAsyncCommunication):
         
         if total_input.shape[1] == 1:
             # output = nki_sinle_token_matmul_(total_input, weight)
+            # output = nki_sinle_token_matmul_2(total_input.transpose(1, 2), weight.t())
             output = torch.einsum('...m,mn->...n', total_input, weight.t())
         else:
             B, M, K = total_input.shape
@@ -1257,18 +1317,15 @@ class NkiLinearWithAsyncCommunication(LinearWithAsyncCommunication):
             if  N == 256:
                 output = nki_matmul_hoist_load_(total_input.transpose(1, 2), weight.t())
             else:
-                # print(total_input.transpose(1, 2).shape, weight.t().shape)  
                 if N == 512:
                     TILES_IN_BLOCK_N=1
                 elif N == 1024:
                     TILES_IN_BLOCK_N=2
                 # elif N == 1536:
                 #     TILES_IN_BLOCK_N=3
-                elif N == 2048:
-                    TILES_IN_BLOCK_N=4
                 else:
-                    TILES_IN_BLOCK_N=8
-                
+                    TILES_IN_BLOCK_N=4
+
                 if K == 2048 and N == 2048:
                     TILES_IN_BLOCK_N=4 
                     TILES_IN_BLOCK_K=16
@@ -1286,12 +1343,6 @@ class NkiLinearWithAsyncCommunication(LinearWithAsyncCommunication):
                     TILES_IN_BLOCK_M=16
                     TILES_IN_BLOCK_N=2
                     TILES_IN_BLOCK_K=8
-                
-                # if K == 2048:
-                #     TILES_IN_BLOCK_K=16
-                # elif K == 4096:
-                #     TILES_IN_BLOCK_K=32
-                
 
                 BLOCK_M = TILE_M * TILES_IN_BLOCK_M
                 BLOCK_N = TILE_N * TILES_IN_BLOCK_N
@@ -1309,7 +1360,6 @@ class NkiLinearWithAsyncCommunication(LinearWithAsyncCommunication):
                     ones_matrix = torch.ones((res, K ), dtype=total_input.dtype, device=total_input.device)
                     weight =  torch.cat((weight, ones_matrix), axis=0)
                 
-                # print(BLOCK_K, total_input.transpose(1, 2).shape, weight.t().shape)
                 output = nki_matmul_fully_optimized_copy_(total_input.transpose(1, 2), weight.t(),
                                                             TILES_IN_BLOCK_M,TILES_IN_BLOCK_N,TILES_IN_BLOCK_K,
                                                         )[:, :M, :N]
@@ -1317,23 +1367,7 @@ class NkiLinearWithAsyncCommunication(LinearWithAsyncCommunication):
 
         ###########################
 
-            # def custom_allclose(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float):
-            #     # equivalent to torch.allclose except rtol is multiplied by absolute max, not abs
-            #     # this matches the behavior of the compiler's birsim-to-xla_infergoldens verification
-            #     error = (torch.abs(a - b) - atol) / torch.max(torch.abs(b))
-            #     passed = torch.all(error <= rtol)
-            #     return passed.item(), torch.max(error).item()
-            
-            # passed, max_error =  custom_allclose(output, output2, atol=1e-05, rtol=0.05)
-            # assert passed, f"output != output2 {max_error}"
-
-            # output = torch.matmul(total_input, weight.t())
-            
-            # if torch.allclose(output1, output, atol=1e-4, rtol=1e-2):
-            #     print("output1 and output2 match")
-            # else:
-            #     print("output1 and output2 differ")
-        ###########################
+        
         if bias is not None:
             output = output + bias
         return output
@@ -1448,7 +1482,8 @@ class NkiLmLinearWithAsyncCommunication(LinearWithAsyncCommunication):
         ######################################################
         
         if total_input.shape[1] == 1:
-            output = nki_sinle_token_matmul_(total_input, weight)
+            # output = nki_sinle_token_matmul_(total_input, weight)
+            output = torch.matmul(total_input, weight.t())
         else:
             B, M, K = total_input.shape
             N, K_ = weight.shape
@@ -2360,23 +2395,23 @@ class NeuronLlamaMLP(nn.Module):
                 x, self.sequence_dimension, process_group=get_tp_group(self.config)
             )
 
-        gate_proj_output = (
-            self.gate_proj(x, rmsnorm)
-            if not is_lora_module(self.gate_proj)
-            else self.gate_proj(x, adapter_ids)
-        )
+        # gate_proj_output = (
+        #     self.gate_proj(x, rmsnorm)
+        #     if not is_lora_module(self.gate_proj)
+        #     else self.gate_proj(x, adapter_ids)
+        # )
 
-        up_proj_output = (
-            self.up_proj(x, rmsnorm) if not is_lora_module(self.up_proj) else self.up_proj(x, adapter_ids)
-        )
+        # up_proj_output = (
+        #     self.up_proj(x, rmsnorm) if not is_lora_module(self.up_proj) else self.up_proj(x, adapter_ids)
+        # )
 
-        down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
+        # down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
 
-        output = (
-            self.down_proj(down_proj_input)
-            if not is_lora_module(self.up_proj)
-            else self.down_proj(down_proj_input, adapter_ids)
-        )
+        # output = (
+        #     self.down_proj(down_proj_input)
+        #     if not is_lora_module(self.up_proj)
+        #     else self.down_proj(down_proj_input, adapter_ids)
+        # )
 
         #################
         
@@ -2384,9 +2419,14 @@ class NeuronLlamaMLP(nn.Module):
         # up_proj_output = nki_matmul(x, self.up_proj.weight)
 
 
-        # gate_proj_output, up_proj_output =nki_fuse_up_gate_matmul(x, self.gate_proj.weight, self.up_proj.weight)
-        # down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
+        gate_proj_output, up_proj_output =nki_fuse_up_gate_matmul(x, self.gate_proj.weight, self.up_proj.weight)
+        down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
         # output = nki_matmul(down_proj_input, self.down_proj.weight)
+        output = (
+            self.down_proj(down_proj_input)
+            if not is_lora_module(self.up_proj)
+            else self.down_proj(down_proj_input, adapter_ids)
+        )
 
         #################
         
@@ -2788,9 +2828,18 @@ def fused_att_interface(Q, K, V, use_causal_mask=False, mixed_precision=True, at
   assert K.shape == V.shape == (B, H, S, D), 'Input shape mismatch!'
   if att_mask is not None:
     assert att_mask.shape == (S, S), 'Attention mask shape mismatch!'
+#   if S < 128:
+#     softmax_scale = 1.0 / math.sqrt(D)
+#     q_scaled = Q * softmax_scale
+#     raw_score = torch.matmul(q_scaled, K.transpose(3, 2))
+#     if att_mask is not None:
+#       raw_score = torch.where(att_mask, raw_score, -9984.0)
+    
+#     norm_score = torch.nn.functional.softmax(raw_score, dim=-1)
 
-#   S_padded = ((S + 127) // 128) * 128  
-  S_padded = ((S + 255) // 256) * 256  
+#     return torch.matmul(norm_score, V)
+
+  S_padded = ((S + 127) // 128) * 128  
   padding_needed = S_padded - S  
   Q = torch.nn.functional.pad(Q, (0, 0, 0, padding_needed))
   K = torch.nn.functional.pad(K, (0, 0, 0, padding_needed))
@@ -3046,7 +3095,6 @@ def fused_att_interface_decode(Q, K, V, use_causal_mask=False, mixed_precision=T
     S = K.shape[2]
     assert K.shape == V.shape == (B, H, S, D), f"K/V shape mismatch! Expected {(B, H, S, D)}, got K:{K.shape}, V:{V.shape}"
     
-    # S_padded = ((S + 127) // 128) * 128  
     S_padded = ((S + 255) // 256) * 256  
     padding_needed = S_padded - S
     
@@ -3089,9 +3137,9 @@ def fused_att_interface_decode(Q, K, V, use_causal_mask=False, mixed_precision=T
         )[:, :, :S, :]
 
 
-
 @register_module("NeuronLlamaAttention")
 class NeuronLlamaAttention(NeuronLlamaAttentionBase):
+    
     def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask) -> Tensor:
         """attention computation at prefilling (context encoding) phase"""
         K_active = repeat_kv(K, self.num_key_value_groups)
@@ -3175,45 +3223,82 @@ class NeuronLlamaAttention(NeuronLlamaAttentionBase):
             attn_output = fused_att_interface(Q, K_active, V_active, att_mask=attention_mask.view(q_len, q_len))
         return attn_output, flash_attn_strategy
 
+
+    # def compute_for_token_gen(
+    #     self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
+    # ) -> Tensor:
+    #     """attention computation at token generation phase"""
+    #     is_speculation = position_ids.shape[-1] > 1
+
+    #     # Attention computation: softmax((Q.K/√dkv) + mask).V
+    #     # i. prior (cached) KV
+    #     K_prior = past_key_value[0]
+    #     V_prior = past_key_value[1]
+    #     K_prior = repeat_kv(K_prior, self.num_key_value_groups)
+    #     V_prior = repeat_kv(V_prior, self.num_key_value_groups)
+    #     prior_scores = torch.matmul(Q, K_prior.transpose(2, 3)) / math.sqrt(self.head_dim)
+    #     prior_scores = torch.where(
+    #         attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
+    #     )
+    #     prior_scores = prior_scores.to(torch.float32)
+
+    #     # ii. active (current/new) KV
+    #     K_active = repeat_kv(K, self.num_key_value_groups)
+    #     V_active = repeat_kv(V, self.num_key_value_groups)
+    #     active_scores = torch.matmul(Q, K_active.transpose(2, 3)) / math.sqrt(self.head_dim)
+    #     if is_speculation:
+    #         active_scores = torch.where(
+    #             active_mask, active_scores, torch.finfo(active_scores.dtype).min
+    #         )
+    #     active_scores = active_scores.to(torch.float32)
+
+    #     # iii. attention scores
+    #     softmax_prior, softmax_active = manual_softmax(prior_scores, active_scores, is_speculation)
+    #     softmax_prior, softmax_active = softmax_prior.to(Q.dtype), softmax_active.to(Q.dtype)
+    #     attn_prior = torch.matmul(softmax_prior, V_prior)
+    #     attn_active = torch.matmul(softmax_active, V_active)
+    #     attn_output = attn_prior + attn_active
+
+    #     return attn_output
+
     def compute_for_token_gen(
-            self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
-        ) -> Tensor:
-            """attention computation at token generation phase"""
-            # is_speculation = position_ids.shape[-1] > 1
+        self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
+    ) -> Tensor:
+        """attention computation at token generation phase"""
+        # is_speculation = position_ids.shape[-1] > 1
 
-            # # Attention computation: softmax((Q.K/√dkv) + mask).V
-            # # i. prior (cached) KV
-            K_prior, V_prior = past_key_value
-            K_prior = repeat_kv(K_prior, self.num_key_value_groups)
-            V_prior = repeat_kv(V_prior, self.num_key_value_groups)
+        # # Attention computation: softmax((Q.K/√dkv) + mask).V
+        # # i. prior (cached) KV
+        K_prior, V_prior = past_key_value
+        K_prior = repeat_kv(K_prior, self.num_key_value_groups)
+        V_prior = repeat_kv(V_prior, self.num_key_value_groups)
 
-            # # 合并 K_prior 和 K_active
-            K_active = repeat_kv(K, self.num_key_value_groups)  # (B, H, 1, D)
-            K_combined = torch.cat([K_prior, K_active], dim=2)  # (B, H, S+1, D)
+        # # 合并 K_prior 和 K_active
+        K_active = repeat_kv(K, self.num_key_value_groups)  # (B, H, 1, D)
+        K_combined = torch.cat([K_prior, K_active], dim=2)  # (B, H, S+1, D)
 
-            # # 合并 V_prior 和 V_active
-            V_active = repeat_kv(V, self.num_key_value_groups)
-            V_combined = torch.cat([V_prior, V_active], dim=2)  # (B, H, S+1, D)
+        # # 合并 V_prior 和 V_active
+        V_active = repeat_kv(V, self.num_key_value_groups)
+        V_combined = torch.cat([V_prior, V_active], dim=2)  # (B, H, S+1, D)
 
-            # # 合并注意力掩码
-            if active_mask is None:
-                active_mask = torch.ones((1, 1, 1, 1), dtype=torch.bool, device=Q.device)
-            combined_mask = torch.cat([attention_mask, active_mask], dim=-1)  # (B, 1, 1, S+1)
+        # # 合并注意力掩码
+        if active_mask is None:
+            active_mask = torch.ones((1, 1, 1, 1), dtype=torch.bool, device=Q.device)
+        combined_mask = torch.cat([attention_mask, active_mask], dim=-1)  # (B, 1, 1, S+1)
 
-            # # 统一计算注意力分数
-            # scores = torch.matmul(Q, K_combined.transpose(2, 3)) / math.sqrt(self.head_dim)
-            # scores = torch.where(
-            #     combined_mask, 
-            #     scores, 
-            #     torch.finfo(scores.dtype).min
-            # )
-            # attn_weights = torch.nn.functional.softmax(scores, dim=-1)  # (B, H, 1, S+1)
+        # # 统一计算注意力分数
+        # scores = torch.matmul(Q, K_combined.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # scores = torch.where(
+        #     combined_mask, 
+        #     scores, 
+        #     torch.finfo(scores.dtype).min
+        # )
+        # attn_weights = torch.nn.functional.softmax(scores, dim=-1)  # (B, H, 1, S+1)
 
-            # # 计算注意力输出
-            # attn_output = torch.matmul(attn_weights, V_combined)  # (B, H, 1, D)
-            attn_output = fused_att_interface_decode(Q, K_combined, V_combined, att_mask=combined_mask.view(1, 1, 1, -1))
-            return attn_output
-
+        # # 计算注意力输出
+        # attn_output = torch.matmul(attn_weights, V_combined)  # (B, H, 1, D)
+        attn_output = fused_att_interface_decode(Q, K_combined, V_combined, att_mask=combined_mask.view(1, 1, 1, -1))
+        return attn_output
 
 
 # TODO: Modularize RotaryEmbedding. See how HF transformers does it in 4.43.
@@ -3333,8 +3418,10 @@ class NeuronLlamaDecoderLayer(nn.Module):
 
         # RMSNorm (fused with QKV kernel when SP is disabled)
         if (not self.qkv_kernel_enabled or self.sequence_parallel_enabled) and self.input_layernorm:
+            import time
+            s = time.perf_counter()
             hidden_states = self.input_layernorm(hidden_states)
-            
+            print("rms norm time: ", (time.perf_counter() - s) * 1000)
 
         # Self Attention
         hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
@@ -3545,3 +3632,5 @@ class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
     @classmethod
     def get_config_cls(cls):
         return LlamaInferenceConfig
+
+
