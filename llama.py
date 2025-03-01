@@ -2789,7 +2789,8 @@ def fused_att_interface(Q, K, V, use_causal_mask=False, mixed_precision=True, at
   if att_mask is not None:
     assert att_mask.shape == (S, S), 'Attention mask shape mismatch!'
 
-  S_padded = ((S + 127) // 128) * 128  
+#   S_padded = ((S + 127) // 128) * 128  
+  S_padded = ((S + 255) // 256) * 256  
   padding_needed = S_padded - S  
   Q = torch.nn.functional.pad(Q, (0, 0, 0, padding_needed))
   K = torch.nn.functional.pad(K, (0, 0, 0, padding_needed))
@@ -3045,7 +3046,8 @@ def fused_att_interface_decode(Q, K, V, use_causal_mask=False, mixed_precision=T
     S = K.shape[2]
     assert K.shape == V.shape == (B, H, S, D), f"K/V shape mismatch! Expected {(B, H, S, D)}, got K:{K.shape}, V:{V.shape}"
     
-    S_padded = ((S + 127) // 128) * 128  
+    # S_padded = ((S + 127) // 128) * 128  
+    S_padded = ((S + 255) // 256) * 256  
     padding_needed = S_padded - S
     
     K = torch.nn.functional.pad(K, (0, 0, 0, padding_needed))  # (B, H, S_padded, D)
