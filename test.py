@@ -23,7 +23,7 @@ def main():
     prompt_data = parse_prompt_data("prompt_data.txt")
     assert len(prompts) == len(prompt_data)
 
-    mode = "evaluate"
+    mode = "evaluate_single"
 
     # Iterate through the prompts
     for i, prompt in enumerate(prompts):
@@ -33,7 +33,7 @@ def main():
         throughput = data[4]
 
         if i == 1:
-            command = f'python main.py --enable-nki --mode {mode} --seq-len {seq_len} --base-latency {latency} --base-throughput {throughput} --prompt "{prompt}" --fused-qkv'
+            command = f'python main.py --mode {mode} --seq-len {seq_len} --base-latency {latency} --base-throughput {throughput} --prompt "{prompt}" --fused-qkv'
             print(command)
             
             with open(f'prompt{i}_out.txt', 'w') as outfile:

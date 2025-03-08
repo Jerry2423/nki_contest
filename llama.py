@@ -2785,7 +2785,7 @@ def fused_self_attn_for_SD_small_head_size(Q_ref, K_ref, V_ref, use_causal_mask=
       dtype=pe_in_dt)
 
     # Result psum buffer has the hidden dim as P
-    attn_res_psum = nl.zeros((par_dim(d_head_tile_size), q_seq_tile_size),
+    attn_res_psum = nl.zeros((par_dim(q_seq_tile_size), d_head_tile_size),
                              dtype=np.float32, buffer=nl.psum)
 
     ip_scores_t = nl.arange(k_seq_tile_size)[:, None]
@@ -2801,8 +2801,8 @@ def fused_self_attn_for_SD_small_head_size(Q_ref, K_ref, V_ref, use_causal_mask=
       trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t] = nisa.nc_transpose(
         softmax_res[ip_scores, i_k_seq_tile * k_seq_tile_size + if_scores])
 
-    ip_out = nl.arange(d_head_tile_size)[:, None]
-    if_out = nl.arange(q_seq_tile_size)[None, :]
+    ip_out = nl.arange(q_seq_tile_size)[:, None]
+    if_out = nl.arange(d_head_tile_size)[None, :]
     for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
       ######################################################################
       # Step 6. matmul_1(stationary=trans_v, moving=trans_softmax_res, contract=seqlen_v=seqlen_k)
@@ -2810,15 +2810,15 @@ def fused_self_attn_for_SD_small_head_size(Q_ref, K_ref, V_ref, use_causal_mask=
       ip_v_t = nl.arange(k_seq_tile_size)[:, None]
       if_v_t = nl.arange(d_head_tile_size)[None, :]
       attn_res_psum[ip_out, if_out] += \
-        nisa.nc_matmul(moving=trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t],
-                       stationary=trans_v[ip_v_t, i_k_seq_tile, if_v_t])
+        nisa.nc_matmul(stationary=trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t],
+                       moving=trans_v[ip_v_t, i_k_seq_tile, if_v_t])
 
     attn_res_sbuf = nl.copy(attn_res_psum[ip_out, if_out], dtype=kernel_dtype)
 
-    attn_res_div = attn_res_sbuf * nisa.nc_transpose(sum_divisor[ip_sum_res, if_sum_res])
+    attn_res_div = attn_res_sbuf * (sum_divisor[ip_sum_res, if_sum_res])
 
     nl.store(
-      out_ref[b_i, h_i ,i_q_seq_tile * q_seq_tile_size + if_out, ip_out],
+      out_ref[b_i, h_i, i_q_seq_tile * q_seq_tile_size + ip_out, if_out],
       value=attn_res_div)
 
   return out_ref
@@ -3224,81 +3224,81 @@ class NeuronLlamaAttention(NeuronLlamaAttentionBase):
         return attn_output, flash_attn_strategy
 
 
-    # def compute_for_token_gen(
-    #     self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
-    # ) -> Tensor:
-    #     """attention computation at token generation phase"""
-    #     is_speculation = position_ids.shape[-1] > 1
-
-    #     # Attention computation: softmax((Q.K/√dkv) + mask).V
-    #     # i. prior (cached) KV
-    #     K_prior = past_key_value[0]
-    #     V_prior = past_key_value[1]
-    #     K_prior = repeat_kv(K_prior, self.num_key_value_groups)
-    #     V_prior = repeat_kv(V_prior, self.num_key_value_groups)
-    #     prior_scores = torch.matmul(Q, K_prior.transpose(2, 3)) / math.sqrt(self.head_dim)
-    #     prior_scores = torch.where(
-    #         attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
-    #     )
-    #     prior_scores = prior_scores.to(torch.float32)
-
-    #     # ii. active (current/new) KV
-    #     K_active = repeat_kv(K, self.num_key_value_groups)
-    #     V_active = repeat_kv(V, self.num_key_value_groups)
-    #     active_scores = torch.matmul(Q, K_active.transpose(2, 3)) / math.sqrt(self.head_dim)
-    #     if is_speculation:
-    #         active_scores = torch.where(
-    #             active_mask, active_scores, torch.finfo(active_scores.dtype).min
-    #         )
-    #     active_scores = active_scores.to(torch.float32)
-
-    #     # iii. attention scores
-    #     softmax_prior, softmax_active = manual_softmax(prior_scores, active_scores, is_speculation)
-    #     softmax_prior, softmax_active = softmax_prior.to(Q.dtype), softmax_active.to(Q.dtype)
-    #     attn_prior = torch.matmul(softmax_prior, V_prior)
-    #     attn_active = torch.matmul(softmax_active, V_active)
-    #     attn_output = attn_prior + attn_active
-
-    #     return attn_output
-
     def compute_for_token_gen(
         self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
     ) -> Tensor:
         """attention computation at token generation phase"""
-        # is_speculation = position_ids.shape[-1] > 1
+        is_speculation = position_ids.shape[-1] > 1
 
-        # # Attention computation: softmax((Q.K/√dkv) + mask).V
-        # # i. prior (cached) KV
-        K_prior, V_prior = past_key_value
+        # Attention computation: softmax((Q.K/√dkv) + mask).V
+        # i. prior (cached) KV
+        K_prior = past_key_value[0]
+        V_prior = past_key_value[1]
         K_prior = repeat_kv(K_prior, self.num_key_value_groups)
         V_prior = repeat_kv(V_prior, self.num_key_value_groups)
+        prior_scores = torch.matmul(Q, K_prior.transpose(2, 3)) / math.sqrt(self.head_dim)
+        prior_scores = torch.where(
+            attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
+        )
+        prior_scores = prior_scores.to(torch.float32)
 
-        # # 合并 K_prior 和 K_active
-        K_active = repeat_kv(K, self.num_key_value_groups)  # (B, H, 1, D)
-        K_combined = torch.cat([K_prior, K_active], dim=2)  # (B, H, S+1, D)
-
-        # # 合并 V_prior 和 V_active
+        # ii. active (current/new) KV
+        K_active = repeat_kv(K, self.num_key_value_groups)
         V_active = repeat_kv(V, self.num_key_value_groups)
-        V_combined = torch.cat([V_prior, V_active], dim=2)  # (B, H, S+1, D)
+        active_scores = torch.matmul(Q, K_active.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if is_speculation:
+            active_scores = torch.where(
+                active_mask, active_scores, torch.finfo(active_scores.dtype).min
+            )
+        active_scores = active_scores.to(torch.float32)
 
-        # # 合并注意力掩码
-        if active_mask is None:
-            active_mask = torch.ones((1, 1, 1, 1), dtype=torch.bool, device=Q.device)
-        combined_mask = torch.cat([attention_mask, active_mask], dim=-1)  # (B, 1, 1, S+1)
+        # iii. attention scores
+        softmax_prior, softmax_active = manual_softmax(prior_scores, active_scores, is_speculation)
+        softmax_prior, softmax_active = softmax_prior.to(Q.dtype), softmax_active.to(Q.dtype)
+        attn_prior = torch.matmul(softmax_prior, V_prior)
+        attn_active = torch.matmul(softmax_active, V_active)
+        attn_output = attn_prior + attn_active
 
-        # # 统一计算注意力分数
-        # scores = torch.matmul(Q, K_combined.transpose(2, 3)) / math.sqrt(self.head_dim)
-        # scores = torch.where(
-        #     combined_mask, 
-        #     scores, 
-        #     torch.finfo(scores.dtype).min
-        # )
-        # attn_weights = torch.nn.functional.softmax(scores, dim=-1)  # (B, H, 1, S+1)
-
-        # # 计算注意力输出
-        # attn_output = torch.matmul(attn_weights, V_combined)  # (B, H, 1, D)
-        attn_output = fused_att_interface_decode(Q, K_combined, V_combined, att_mask=combined_mask.view(1, 1, 1, -1))
         return attn_output
+
+    # def compute_for_token_gen(
+    #     self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
+    # ) -> Tensor:
+    #     """attention computation at token generation phase"""
+    #     # is_speculation = position_ids.shape[-1] > 1
+
+    #     # # Attention computation: softmax((Q.K/√dkv) + mask).V
+    #     # # i. prior (cached) KV
+    #     K_prior, V_prior = past_key_value
+    #     K_prior = repeat_kv(K_prior, self.num_key_value_groups)
+    #     V_prior = repeat_kv(V_prior, self.num_key_value_groups)
+
+    #     # # 合并 K_prior 和 K_active
+    #     K_active = repeat_kv(K, self.num_key_value_groups)  # (B, H, 1, D)
+    #     K_combined = torch.cat([K_prior, K_active], dim=2)  # (B, H, S+1, D)
+
+    #     # # 合并 V_prior 和 V_active
+    #     V_active = repeat_kv(V, self.num_key_value_groups)
+    #     V_combined = torch.cat([V_prior, V_active], dim=2)  # (B, H, S+1, D)
+
+    #     # # 合并注意力掩码
+    #     if active_mask is None:
+    #         active_mask = torch.ones((1, 1, 1, 1), dtype=torch.bool, device=Q.device)
+    #     combined_mask = torch.cat([attention_mask, active_mask], dim=-1)  # (B, 1, 1, S+1)
+
+    #     # # 统一计算注意力分数
+    #     # scores = torch.matmul(Q, K_combined.transpose(2, 3)) / math.sqrt(self.head_dim)
+    #     # scores = torch.where(
+    #     #     combined_mask, 
+    #     #     scores, 
+    #     #     torch.finfo(scores.dtype).min
+    #     # )
+    #     # attn_weights = torch.nn.functional.softmax(scores, dim=-1)  # (B, H, 1, S+1)
+
+    #     # # 计算注意力输出
+    #     # attn_output = torch.matmul(attn_weights, V_combined)  # (B, H, 1, D)
+    #     attn_output = fused_att_interface_decode(Q, K_combined, V_combined, att_mask=combined_mask.view(1, 1, 1, -1))
+    #     return attn_output
 
 
 # TODO: Modularize RotaryEmbedding. See how HF transformers does it in 4.43.
