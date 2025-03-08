@@ -2597,7 +2597,7 @@ class NeuronLlamaAttentionBase(NeuronAttentionBase):
 
 
 @nki.jit
-def fused_self_attn_for_SD_small_head_size(Q_ref, K_ref, V_ref, use_causal_mask=False,
+def fused_self_attn_for_SD_small_head_size(Q_ref, K_ref, V_ref, orig_seqlen, use_causal_mask=False,
                                            mixed_precision=True, att_mask = None):
   """
   Fused self attention kernel for small head dimension Stable Diffusion workload, 
@@ -2735,13 +2735,25 @@ def fused_self_attn_for_SD_small_head_size(Q_ref, K_ref, V_ref, use_causal_mask=
       #   # Simply send psum result back to sbuf
       #   qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.copy(qk_psum[ip_qk, if_qk],
       #                                                                         dtype=kernel_dtype)
-      
-      
-      if att_mask is not None:
-        mask_sbuf = nl.load(att_mask[i_q_seq_tile * q_seq_tile_size + ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk], dtype=att_mask.dtype)
-        qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.where(mask_sbuf, qk_psum[ip_qk, if_qk], -3.38953139e+38, dtype=kernel_dtype)
+      if use_causal_mask:
+        # Magic number -9984.0 to replace -inf similar to what neuronx-cc uses
+        # qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nisa.affine_select(
+        #   pred=(i_q_seq_tile * q_seq_tile_size + ip_qk >= i_k_seq_tile * k_seq_tile_size + if_qk),
+        #   on_true_tile=qk_psum[ip_qk, if_qk], on_false_value=-9984.0, dtype=kernel_dtype)
+        pred = ((i_q_seq_tile * q_seq_tile_size + ip_qk >= i_k_seq_tile * k_seq_tile_size + if_qk) & (i_q_seq_tile * q_seq_tile_size + ip_qk < orig_seqlen) & (i_k_seq_tile * k_seq_tile_size + if_qk < orig_seqlen)) 
+        qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.where(condition=pred, x=qk_psum[ip_qk, if_qk], y=-3.38953139e+38)
       else:
-        qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.copy(qk_psum[ip_qk, if_qk], dtype=kernel_dtype)
+        # Simply send psum result back to sbuf
+        qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.copy(qk_psum[ip_qk, if_qk],
+                                                                              dtype=kernel_dtype)
+
+
+      
+    #   if att_mask is not None:
+    #     mask_sbuf = nl.load(att_mask[i_q_seq_tile * q_seq_tile_size + ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk], dtype=att_mask.dtype)
+    #     qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.where(mask_sbuf, qk_psum[ip_qk, if_qk], -3.38953139e+38, dtype=kernel_dtype)
+    #   else:
+    #     qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.copy(qk_psum[ip_qk, if_qk], dtype=kernel_dtype)
 
       # if att_mask is not None:
       #   print(f"({i_q_seq_tile, i_k_seq_tile})")
@@ -2823,7 +2835,7 @@ def fused_self_attn_for_SD_small_head_size(Q_ref, K_ref, V_ref, use_causal_mask=
 
   return out_ref
 
-def fused_att_interface(Q, K, V, use_causal_mask=False, mixed_precision=True, att_mask=None):
+def fused_att_interface(Q, K, V, use_causal_mask=True, mixed_precision=True, att_mask=None):
   B, H, S, D = Q.shape
   assert K.shape == V.shape == (B, H, S, D), 'Input shape mismatch!'
   if att_mask is not None:
@@ -2844,11 +2856,11 @@ def fused_att_interface(Q, K, V, use_causal_mask=False, mixed_precision=True, at
   Q = torch.nn.functional.pad(Q, (0, 0, 0, padding_needed))
   K = torch.nn.functional.pad(K, (0, 0, 0, padding_needed))
   V = torch.nn.functional.pad(V, (0, 0, 0, padding_needed))
-  pad_mask = torch.zeros((S_padded, S_padded), dtype=torch.bool).to(device=Q.device)
-  if att_mask is not None:
-    pad_mask[:S, :S] = att_mask
-  else:
-    pad_mask[:S, :S] = True
+#   pad_mask = torch.zeros((S_padded, S_padded), dtype=torch.bool).to(device=Q.device)
+#   if att_mask is not None:
+#     pad_mask[:S, :S] = att_mask
+#   else:
+#     pad_mask[:S, :S] = True
   # TODO: Handle the case where S_padded > 2**14, the following code is incorrect at the softmax step
   if S_padded > 2**14:
     chunk_size = 2**14
@@ -2861,7 +2873,8 @@ def fused_att_interface(Q, K, V, use_causal_mask=False, mixed_precision=True, at
       processed_chunks.append(processed_chunk)
     return torch.cat(processed_chunks, dim=2)[:, :, :S, :]
   else:
-    return fused_self_attn_for_SD_small_head_size[B, H](Q, K, V, use_causal_mask, mixed_precision, pad_mask)[:, :, :S, :]
+    return fused_self_attn_for_SD_small_head_size[B, H](Q, K, V, S, use_causal_mask, mixed_precision)[:, :, :S, :]
+
 
 
 @nki.jit
