@@ -17,52 +17,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch LLaMA model for NXD inference."""
 
-########################################################
 
-# command: python --mode evaluate --fused-qkv
-# prompts = ["I believe the meaning of life is"]
-# results: 
-# Benchmark completed and its result is as following
-# {
-#     "e2e_model": {
-#         "latency_ms_p50": 282.39619731903076,
-#         "latency_ms_p90": 288.293981552124,
-#         "latency_ms_p95": 292.54584312438965,
-#         "latency_ms_p99": 293.65187644958496,
-#         "latency_ms_p100": 293.9283847808838,
-#         "latency_ms_avg": 282.977557182312,
-#         "throughput": 226.1663456185932
-#     },
-#     "context_encoding_model": {
-#         "latency_ms_p50": 27.979016304016113,
-#         "latency_ms_p90": 28.334927558898926,
-#         "latency_ms_p95": 28.338372707366943,
-#         "latency_ms_p99": 28.34833860397339,
-#         "latency_ms_p100": 28.350830078125,
-#         "latency_ms_avg": 28.06878089904785,
-#         "throughput": 1140.056638551249
-#     },
-#     "token_generation_model": {
-#         "latency_ms_p50": 6.625533103942871,
-#         "latency_ms_p90": 6.910085678100586,
-#         "latency_ms_p95": 6.943941116333008,
-#         "latency_ms_p99": 7.375626564025878,
-#         "latency_ms_p100": 7.453441619873047,
-#         "latency_ms_avg": 6.702198520783455,
-#         "throughput": 154.0178288236474
-#     }
-# }
-# Completed saving result to benchmark_report.json
-# Final Score: 1.5032075988902478
-#         Accuracy: True
-#         Latency: 293.65187644958496
-#         Throughput: 226.1663456185932
-#         NKI FLOPs Ratio: 0.9885663150025485
 
-########################################################
 
+"""
+Author: Dinghong Song, Jierui Xu, Dong Li
+Date: 2025-03-10
+Description: AWS NKI Contest llama.py
+
+Please run the following command.
+command: python main.py --enable-nki --mode evaluate_all --seq-len 640 --fused-qkv --context-encoding-buckets 640 --token-generation-buckets 640
+Total Score: 11.005262841442393
+
+"""
 
 
 import copy
@@ -564,22 +532,43 @@ def nki_matmul_hoist_load_(lhsT, rhs):
             for k in nl.affine_range(K // TILE_K):
                 lhsT_tiles[k, i_lhsT.p, i_lhsT.x] = nl.load(lhsT[b, k * TILE_K + i_lhsT.p,
                                                                 m * TILE_M + i_lhsT.x])
-            for n in nl.affine_range(N // TILE_N):
-                rhs_tiles = nl.ndarray((K // TILE_K, nl.par_dim(TILE_K), TILE_N),
+            
+            if N % TILE_N:
+                i_rhs = nl.mgrid[0:TILE_K, 0:N]
+                i_res = nl.mgrid[0:TILE_M, 0:N]
+                rhs_tiles = nl.ndarray((K // TILE_K, nl.par_dim(TILE_K), N),
                                     dtype=rhs.dtype,
                                     buffer=nl.sbuf)
                 
                 for k in nl.affine_range(K // TILE_K):
                     rhs_tiles[k, i_rhs.p, i_rhs.x] = nl.load(rhs[k * TILE_K + i_rhs.p,
-                                                                n * TILE_N + i_rhs.x])
+                                                                i_rhs.x])
                 
-                res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
+                res_psum = nl.zeros((TILE_M, N), nl.float32, buffer=nl.psum)
                 for k in nl.affine_range(K // TILE_K):
                     res_psum[...] += nisa.nc_matmul(lhsT_tiles[k, i_lhsT.p, i_lhsT.x],
                                             rhs_tiles[k, i_rhs.p, i_rhs.x]
                                             )
                 res_sbuf = nl.copy(res_psum, dtype=result.dtype)
-                nl.store(result[b, m * TILE_M + i_res.p, n * TILE_N + i_res.x], value=res_sbuf)
+                nl.store(result[b, m * TILE_M + i_res.p, i_res.x], value=res_sbuf)
+
+            else:
+                for n in nl.affine_range(N // TILE_N):
+                    rhs_tiles = nl.ndarray((K // TILE_K, nl.par_dim(TILE_K), TILE_N),
+                                        dtype=rhs.dtype,
+                                        buffer=nl.sbuf)
+                    
+                    for k in nl.affine_range(K // TILE_K):
+                        rhs_tiles[k, i_rhs.p, i_rhs.x] = nl.load(rhs[k * TILE_K + i_rhs.p,
+                                                                    n * TILE_N + i_rhs.x])
+                    
+                    res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
+                    for k in nl.affine_range(K // TILE_K):
+                        res_psum[...] += nisa.nc_matmul(lhsT_tiles[k, i_lhsT.p, i_lhsT.x],
+                                                rhs_tiles[k, i_rhs.p, i_rhs.x]
+                                                )
+                    res_sbuf = nl.copy(res_psum, dtype=result.dtype)
+                    nl.store(result[b, m * TILE_M + i_res.p, n * TILE_N + i_res.x], value=res_sbuf)
             
         if M % TILE_M:
             m = M // TILE_M
@@ -1033,6 +1022,64 @@ def nki_matmul(hidden, weight):
                                                     )[:, :M, :N]
     return output
 
+def nki_fuse_up_gate_matmul_new(hidden, gate_w, up_w):
+    
+    split_idx = up_w.shape[0]
+    weight=torch.cat((gate_w, up_w), dim=0)
+
+    if hidden.shape[1] == 1:
+        # output = nki_sinle_token_matmul_(hidden, weight)
+        output = torch.einsum('...m,mn->...n', hidden, weight)
+    else:
+        B, M, K = hidden.shape
+        N, K_ = weight.shape
+    
+
+        TILE_M = nl.tile_size.gemm_stationary_fmax
+        TILE_K = nl.tile_size.pmax
+        TILE_N = nl.tile_size.gemm_moving_fmax
+
+        TILES_IN_BLOCK_K=8
+        TILES_IN_BLOCK_M=1
+        if  N == 256:
+            output = nki_matmul_hoist_load_(hidden.transpose(1, 2), weight)
+        else:
+            if N == 512:
+                TILES_IN_BLOCK_N=1
+            elif N == 1024:
+                TILES_IN_BLOCK_N=2
+            # elif N == 1536:
+            #     TILES_IN_BLOCK_N=3
+            else:
+                TILES_IN_BLOCK_N=4
+            
+
+            BLOCK_M = TILE_M * TILES_IN_BLOCK_M
+            BLOCK_N = TILE_N * TILES_IN_BLOCK_N
+            BLOCK_K = TILE_K * TILES_IN_BLOCK_K
+
+            if M < BLOCK_M:
+                ones_matrix = torch.ones((B, BLOCK_M - M, K ), dtype=hidden.dtype, device=hidden.device)
+                hidden = torch.cat((hidden, ones_matrix), axis=1)
+            
+            if N % BLOCK_N:
+            # if N // BLOCK_N:
+                # n = N // BLOCK_N
+                # res = BLOCK_N * (n + 1) - N
+                res = BLOCK_N - (N % BLOCK_N)
+                ones_matrix = torch.ones((res, K ), dtype=hidden.dtype, device=hidden.device)
+                weight =  torch.cat((weight, ones_matrix), axis=0)
+            
+            output = nki_matmul_fully_optimized_copy_(hidden.transpose(1, 2), weight,
+                                                        TILES_IN_BLOCK_M,TILES_IN_BLOCK_N,TILES_IN_BLOCK_K,
+                                                    )[:, :M, :N]
+    
+
+           
+    gate_proj_output, up_proj_output = torch.split(output, split_idx, dim=2)
+    return gate_proj_output, up_proj_output
+
+
 def nki_fuse_up_gate_matmul(hidden, gate_w, up_w):
     
     split_idx = up_w.shape[0]
@@ -1104,37 +1151,24 @@ class CustomRMSNorm(nn.Module):
         self.nki_enabled = nki_enabled
 
     def forward(self, hidden_states):
-        if self.nki_enabled:
+        # if self.nki_enabled:
 
-            if hidden_states.shape[1] == 1:  # token generation
-                out_tensor = nki_rmsnorm_single_token(hidden=hidden_states, gamma=self.weight, eps=self.variance_epsilon)
+        #     if hidden_states.shape[1] == 1:  # token generation
+        #         out_tensor = nki_rmsnorm_single_token(hidden=hidden_states, gamma=self.weight, eps=self.variance_epsilon)
                 
-                # original_dtype = hidden_states.dtype
-                # hidden_states = hidden_states.to(torch.float32)
-                # out_tensor = RmsNorm.apply(
-                #     hidden_states, self.weight, self.variance_epsilon, len(hidden_states.shape) - 1
-                # )
-                # out_tensor = out_tensor.to(original_dtype)
+        #         # original_dtype = hidden_states.dtype
+        #         # hidden_states = hidden_states.to(torch.float32)
+        #         # out_tensor = RmsNorm.apply(
+        #         #     hidden_states, self.weight, self.variance_epsilon, len(hidden_states.shape) - 1
+        #         # )
+        #         # out_tensor = out_tensor.to(original_dtype)
             
-            else:
-                out_tensor = nki_rmsnorm(hidden=hidden_states, gamma=self.weight, eps=self.variance_epsilon)
+        #     else:
+        #         out_tensor = nki_rmsnorm(hidden=hidden_states, gamma=self.weight, eps=self.variance_epsilon)
             
-            return out_tensor
+        #     return out_tensor
 
 
-        # def torch_rmsnorm_kernel(a_tensor, g_tensor, eps):
-        #     # Square the tensor (element-wise)
-        #     in_square = a_tensor.pow(2)
-        #     # Calculate means in the free dimension
-        #     mean = in_square.mean(dim=1, keepdim=True)
-
-        #     s = mean + eps
-        #     # Scale by reciprocal of sqrt(mean)
-        #     tensor = a_tensor * torch.rsqrt(s)
-
-        #     # Scale the output by the weight
-        #     return tensor * g_tensor
-        # out_tensor = torch_rmsnorm_kernel(hidden_states, self.weight, self.variance_epsilon)
 
         original_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
@@ -1339,10 +1373,10 @@ class NkiLinearWithAsyncCommunication(LinearWithAsyncCommunication):
                     TILES_IN_BLOCK_N=4
                     TILES_IN_BLOCK_K=16
 
-                if M >= 2048:
-                    TILES_IN_BLOCK_M=16
-                    TILES_IN_BLOCK_N=2
-                    TILES_IN_BLOCK_K=8
+                # if M >= 5120:
+                #     TILES_IN_BLOCK_M=16
+                #     TILES_IN_BLOCK_N=2
+                #     TILES_IN_BLOCK_K=8
 
                 BLOCK_M = TILE_M * TILES_IN_BLOCK_M
                 BLOCK_N = TILE_N * TILES_IN_BLOCK_N
@@ -1367,7 +1401,7 @@ class NkiLinearWithAsyncCommunication(LinearWithAsyncCommunication):
 
         ###########################
 
-        
+
         if bias is not None:
             output = output + bias
         return output
@@ -2139,6 +2173,13 @@ class NeuronLlamaMLP(nn.Module):
                     reduce_dtype=config.neuron_config.rpl_reduce_dtype,
                 )
 
+
+                    # Transpose the weights to the layout expected by kernels
+                
+                # self.gate_proj.weight = transpose_parallel_linear_layer(self.gate_proj.weight)
+                # self.up_proj.weight = transpose_parallel_linear_layer(self.up_proj.weight)
+                # self.down_proj.weight = transpose_parallel_linear_layer(self.down_proj.weight)
+        
             if self.mlp_kernel_enabled:
                 if self.quantized_mlp_kernel_enabled:
                     preprocess_quantized_linear_layer(self.gate_proj)
@@ -2454,7 +2495,6 @@ class NeuronLlamaMLP(nn.Module):
             # No kernel
             return (self._native_mlp(x, rmsnorm, adapter_ids=adapter_ids), None)
 
-
 class NeuronLlamaAttentionBase(NeuronAttentionBase):
     """
     Compared with LlamaAttention, this class just
@@ -2593,7 +2633,6 @@ class NeuronLlamaAttentionBase(NeuronAttentionBase):
                 # Warning: The HF implementation may have precision issues when run on Neuron.
                 # We include it here for compatibility with other scaling types.
                 self.rotary_emb = LlamaRotaryEmbedding(self.config)
-
 
 
 @nki.jit
@@ -2835,6 +2874,239 @@ def fused_self_attn_for_SD_small_head_size(Q_ref, K_ref, V_ref, orig_seqlen, use
 
   return out_ref
 
+
+@nki.jit
+def fused_self_attn_for_SD_small_head_size_wo_spmd(Q_ref, K_ref, V_ref, use_causal_mask=False,
+                                           mixed_precision=True, att_mask = None):
+  """
+  Fused self attention kernel for small head dimension Stable Diffusion workload, 
+  simplified for this tutorial. 
+  
+  Computes softmax(QK^T)V. Decoder model can optionally include a causal mask 
+  application. Does not include QKV projection, output projection, dropout, 
+  residual connection, etc.
+
+  This kernel is designed to be used for Stable Diffusion models where the 
+  d_head is smaller or equal to 128. Assertion is thrown if `d_head` does
+  not satisfy the requirement.
+
+  IO tensor layouts:
+   - q_ptr: shape   (seq_q, d_head)
+   - k_ptr: shape   (seq_k, d_head)
+   - v_ptr: shape   (seq_v, d_head)
+   - out_ptr: shape (seq_q, d_head)
+   - We use seq_q and seq_k and seq_v just for clarity, this kernel requires 
+   seq_q == seq_k == seq_v
+
+  IO tensor dtypes:
+   - This kernel assumes all IO tensors have the same dtype
+   - If mixed_precision is True, then all Tensor Engine operation will be performed in
+   bfloat16 and accumulation will be performed in float32. Otherwise the intermediates
+   will be in the same type as the inputs.
+  """
+  # Use q_ref dtype as the intermediate tensor dtype
+  # Assume all IO tensors have the same dtype
+#   b_i = nl.program_id(0)
+#   h_i = nl.program_id(1)
+  
+    
+  kernel_dtype = Q_ref.dtype
+  pe_in_dt = nl.bfloat16 if mixed_precision else np.float32
+#   assert q_ref.dtype == k_ref.dtype == v_ref.dtype
+
+  # Shape checking
+  B_sz, H_sz, seqlen, d_head = Q_ref.shape
+  assert d_head <= 128, "Cannot use this kernel for d_head > 128"
+#   assert tuple(q_ref.shape) == (seqlen, d_head), 'Input shape mismatch!'
+#   assert tuple(k_ref.shape) == (seqlen, d_head), 'Input shape mismatch!'
+#   assert tuple(v_ref.shape) == (seqlen,d_head), \
+#   f'Input shape mismatch! Expected: {(seqlen, d_head)} Actual: {tuple(v_ref.shape)}'
+  assert B_sz == K_ref.shape[0] == V_ref.shape[0], 'Batch size mismatch!'
+  assert H_sz == K_ref.shape[1] == V_ref.shape[1], 'Head size mismatch!'
+
+  if att_mask is not None:
+    assert att_mask.shape == (seqlen, seqlen), 'Attention mask shape mismatch!'
+  
+  out_ref = nl.ndarray((B_sz, H_sz, seqlen, d_head), dtype=Q_ref.dtype, buffer=nl.shared_hbm)
+
+  # Softmax scaling factor, multiplied onto Q
+  softmax_scale = 1.0 / np.sqrt(d_head)
+
+  q_seq_n_tiles, q_seq_tile_size = seqlen // 128, 128
+  k_seq_n_tiles, k_seq_tile_size = seqlen // 128, 128
+  # No tiling on d_head dimension since the dimension of d_head fits in SB
+  d_head_tile_size = d_head
+  v_seq_n_tiles, v_seq_tile_size = seqlen // 128, 128
+
+  
+  for b_i in nl.affine_range(B_sz):
+    for h_i in nl.affine_range(H_sz):
+        q_ref = Q_ref[b_i, h_i]
+        k_ref = K_ref[b_i, h_i]
+        v_ref = V_ref[b_i, h_i]
+      ###################################
+        # Step 1. transpose(tensor_v)
+        ###################################
+        # Buffer for v matrix transposed
+        # Pre-fetch and keep it in SBUF throughout different softmax tiles
+        trans_v = nl.ndarray((par_dim(v_seq_tile_size), v_seq_n_tiles, d_head), dtype=pe_in_dt)
+
+        for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+            ip_v = nl.arange(v_seq_tile_size)[:, None]
+            if_v = nl.arange(d_head_tile_size)[None, :]
+            trans_v[ip_v, i_k_seq_tile, if_v] = nl.load(
+            v_ref[i_k_seq_tile * k_seq_tile_size + ip_v, if_v],
+            dtype=pe_in_dt)
+
+        q_local = nl.ndarray((q_seq_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=pe_in_dt)
+        ip_q = nl.arange(d_head_tile_size)[:, None]
+        if_q = nl.arange(q_seq_tile_size)[None, :]
+        for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):
+            q_local[i_q_seq_tile, ip_q, if_q] = nl.load_transpose2d(
+            q_ref[i_q_seq_tile * q_seq_tile_size + nl.arange(q_seq_tile_size)[:, None],
+                    nl.arange(d_head_tile_size)[None, :]
+            ],
+            dtype=pe_in_dt) * softmax_scale
+
+        k_local = nl.ndarray((k_seq_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size), dtype=pe_in_dt)
+        ip_k = nl.arange(d_head_tile_size)[:, None]
+        if_k = nl.arange(k_seq_tile_size)[None, :]
+        for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+            k_local[i_k_seq_tile, ip_k, if_k] = nl.load_transpose2d(
+            k_ref[i_k_seq_tile * k_seq_tile_size + nl.arange(k_seq_tile_size)[:, None],
+                    nl.arange(d_head_tile_size)[None, :]],
+            dtype=pe_in_dt)
+
+        for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):  # indent = 2
+            # A SBUF buffer for an independent softmax tile
+            qk_res_buf = nl.ndarray((par_dim(q_seq_tile_size), seqlen), dtype=kernel_dtype)
+
+            neg_max_res = nl.ndarray((par_dim(q_seq_tile_size), k_seq_n_tiles), dtype=kernel_dtype)
+            ip_max = nl.arange(q_seq_tile_size)[:, None]
+            if_max = nl.arange(k_seq_n_tiles)[None, :]
+
+            # Loop over RHS free of matmul(stationary=tensor_q, moving=tensor_k, contract=d_head)
+            for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):  # indent = 4
+
+                # Since the K^T tile is the RHS, the q_seq_len dimension will be P in the result
+                # PSUM buffer shape: [q_seq_tile_size P, k_seq_tile_size F]
+                qk_psum = nl.zeros((par_dim(q_seq_tile_size), k_seq_tile_size),
+                                    dtype=np.float32, buffer=nl.psum)
+
+                # Tensor indices for accessing qk result in k_seq_tile_size
+                ip_qk = nl.arange(q_seq_tile_size)[:, None]
+                if_qk = nl.arange(k_seq_tile_size)[None, :]
+
+                ##############################################################
+                # Step 2. matmul(stationary=tensor_q, moving=tensor_k, contract=d_head)
+                ##############################################################
+                qk_psum[ip_qk, if_qk] += nisa.nc_matmul(moving=k_local[i_k_seq_tile, ip_k, if_k],
+                                                        stationary=q_local[i_q_seq_tile, ip_q, if_q])
+
+                ###################################
+                # Step 3. Apply optional causal mask
+                ###################################
+                # if use_causal_mask:
+                #   # Magic number -9984.0 to replace -inf similar to what neuronx-cc uses
+                #   qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nisa.affine_select(
+                #     pred=(i_q_seq_tile * q_seq_tile_size + ip_qk >= i_k_seq_tile * k_seq_tile_size + if_qk),
+                #     on_true_tile=qk_psum[ip_qk, if_qk], on_false_value=-9984.0, dtype=kernel_dtype)
+                # else:
+                #   # Simply send psum result back to sbuf
+                #   qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.copy(qk_psum[ip_qk, if_qk],
+                #                                                                         dtype=kernel_dtype)
+                
+                
+                if att_mask is not None:
+                    mask_sbuf = nl.load(att_mask[i_q_seq_tile * q_seq_tile_size + ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk], dtype=att_mask.dtype)
+                    qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.where(mask_sbuf, qk_psum[ip_qk, if_qk], -3.38953139e+38, dtype=kernel_dtype)
+                else:
+                    qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.copy(qk_psum[ip_qk, if_qk], dtype=kernel_dtype)
+
+                # if att_mask is not None:
+                #   print(f"({i_q_seq_tile, i_k_seq_tile})")
+                #   nl.device_print("", att_mask[i_q_seq_tile * q_seq_tile_size + ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk])
+                
+                ###################################
+                # Step 4. Softmax
+                ###################################
+                neg_max_res[ip_max, i_k_seq_tile] = nisa.tensor_reduce(
+                    np.max, data=qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk],
+                    axis=(1,), dtype=kernel_dtype, negate=True)
+
+            neg_max_res_final = nisa.tensor_reduce(
+            np.min, data=neg_max_res[ip_max, if_max],
+            axis=(1,), dtype=kernel_dtype, negate=False)
+
+            ip_softmax = nl.arange(q_seq_tile_size)[:, None]
+            if_softmax = nl.arange(seqlen)[None, :]
+            ip_sum_res = nl.arange(q_seq_tile_size)[:, None]
+            if_sum_res = nl.arange(d_head_tile_size)[None, :]
+
+            softmax_res = nl.ndarray((par_dim(q_seq_tile_size), seqlen), dtype=pe_in_dt)
+            sum_divisor = nl.ndarray((par_dim(q_seq_tile_size), d_head_tile_size), dtype=kernel_dtype)
+
+            # Simply use a large tile of seq_len in size since this is a "blocking" instruction
+            # Assuming the compiler will merge exp and reduce_add into a single instruction on ACT
+            exp_res = nisa.activation(np.exp,
+                                    data=qk_res_buf[ip_softmax, if_softmax],
+                                    bias=neg_max_res_final, scale=1.0)
+
+            sum_res = nisa.tensor_reduce(np.add, data=exp_res, axis=(1,),
+                                dtype=kernel_dtype)
+            softmax_res[ip_softmax, if_softmax] = nl.copy(exp_res, dtype=pe_in_dt)
+
+            sum_reciprocal_broadcast = (1.0 / sum_res).broadcast_to((q_seq_tile_size, d_head_tile_size))
+            sum_divisor[ip_sum_res, if_sum_res] = nl.copy(sum_reciprocal_broadcast, dtype=kernel_dtype)
+
+            # Buffer for transposed softmax results (FP32 in PSUM)
+            trans_softmax_res = nl.ndarray(
+            (par_dim(k_seq_tile_size), k_seq_n_tiles, q_seq_tile_size),
+            dtype=pe_in_dt)
+
+            # Result psum buffer has the hidden dim as P
+            attn_res_psum = nl.zeros((par_dim(d_head_tile_size), q_seq_tile_size),
+                                    dtype=np.float32, buffer=nl.psum)
+
+            ip_scores_t = nl.arange(k_seq_tile_size)[:, None]
+            if_scores_t = nl.arange(q_seq_tile_size)[None, :]
+            # Loop over matmul_1 contraction
+            for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+                ###################################
+                # Step 5. transpose(softmax_res)
+                ###################################
+                ip_scores = nl.arange(q_seq_tile_size)[:, None]
+                if_scores = nl.arange(k_seq_tile_size)[None, :]
+
+                trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t] = nisa.nc_transpose(
+                    softmax_res[ip_scores, i_k_seq_tile * k_seq_tile_size + if_scores])
+
+            ip_out = nl.arange(d_head_tile_size)[:, None]
+            if_out = nl.arange(q_seq_tile_size)[None, :]
+            for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+            ######################################################################
+            # Step 6. matmul_1(stationary=trans_v, moving=trans_softmax_res, contract=seqlen_v=seqlen_k)
+            ######################################################################
+                ip_v_t = nl.arange(k_seq_tile_size)[:, None]
+                if_v_t = nl.arange(d_head_tile_size)[None, :]
+                attn_res_psum[ip_out, if_out] += \
+                    nisa.nc_matmul(moving=trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t],
+                                stationary=trans_v[ip_v_t, i_k_seq_tile, if_v_t])
+
+            attn_res_sbuf = nl.copy(attn_res_psum[ip_out, if_out], dtype=kernel_dtype)
+
+            attn_res_div = attn_res_sbuf * nisa.nc_transpose(sum_divisor[ip_sum_res, if_sum_res])
+
+            nl.store(
+            out_ref[b_i, h_i ,i_q_seq_tile * q_seq_tile_size + if_out, ip_out],
+            value=attn_res_div)
+                   
+
+  return out_ref
+
+
+
+
 def fused_att_interface(Q, K, V, use_causal_mask=True, mixed_precision=True, att_mask=None):
   B, H, S, D = Q.shape
   assert K.shape == V.shape == (B, H, S, D), 'Input shape mismatch!'
@@ -2875,279 +3147,6 @@ def fused_att_interface(Q, K, V, use_causal_mask=True, mixed_precision=True, att
   else:
     return fused_self_attn_for_SD_small_head_size[B, H](Q, K, V, S, use_causal_mask, mixed_precision)[:, :, :S, :]
 
-
-
-@nki.jit
-def fused_self_attn_for_SD_small_head_size_decode(Q_ref, K_ref, V_ref, use_causal_mask=False,
-                                           mixed_precision=True, att_mask=None):
-  """
-  Fused self attention kernel for small head dimension Stable Diffusion workload, 
-  simplified for this tutorial. 
-  
-  Computes softmax(QK^T)V. Decoder model can optionally include a causal mask 
-  application. Does not include QKV projection, output projection, dropout, 
-  residual connection, etc.
-
-  This kernel is designed to be used for Stable Diffusion models where the 
-  d_head is smaller or equal to 128. Assertion is thrown if `d_head` does
-  not satisfy the requirement.
-
-  IO tensor layouts:
-   - q_ptr: shape   (1, d_head)
-   - k_ptr: shape   (seq_k, d_head)
-   - v_ptr: shape   (seq_v, d_head)
-   - out_ptr: shape (seq_q, d_head)
-   - mask: shape    (1, seq_k) (optional)
-   - We use seq_q and seq_k and seq_v just for clarity, this kernel requires 
-   seq_k == seq_v
-
-  IO tensor dtypes:
-   - This kernel assumes all IO tensors have the same dtype
-   - If mixed_precision is True, then all Tensor Engine operation will be performed in
-   bfloat16 and accumulation will be performed in float32. Otherwise the intermediates
-   will be in the same type as the inputs.
-  """
-  # Use q_ref dtype as the intermediate tensor dtype
-  # Assume all IO tensors have the same dtype
-  b_i = nl.program_id(0)
-  h_i = nl.program_id(1)
-  
-  q_ref = Q_ref[b_i, h_i]
-  k_ref = K_ref[b_i, h_i]
-  v_ref = V_ref[b_i, h_i]
-  
-  kernel_dtype = q_ref.dtype
-  pe_in_dt = nl.bfloat16 if mixed_precision else np.float32
-  assert q_ref.dtype == k_ref.dtype == v_ref.dtype
-
-  # Shape checking
-  seqlen, d_head = k_ref.shape
-  assert d_head <= 128, "Cannot use this kernel for d_head > 128"
-  assert tuple(q_ref.shape) == (1, d_head), 'Input shape mismatch!'
-  assert tuple(k_ref.shape) == (seqlen, d_head), 'Input shape mismatch!'
-  assert tuple(v_ref.shape) == (seqlen,d_head), \
-  f'Input shape mismatch! Expected: {(seqlen, d_head)} Actual: {tuple(v_ref.shape)}'
-  B_sz = Q_ref.shape[0]
-  H_sz = Q_ref.shape[1]
-  assert B_sz == K_ref.shape[0] == V_ref.shape[0], 'Batch size mismatch!'
-  assert H_sz == K_ref.shape[1] == V_ref.shape[1], 'Head size mismatch!'
-  out_ref = nl.ndarray((B_sz, H_sz ,1, d_head), dtype=q_ref.dtype, buffer=nl.shared_hbm)
-
-  if att_mask is not None:
-    assert att_mask.shape == (1, seqlen), 'Attention mask shape mismatch!'
-
-  # Softmax scaling factor, multiplied onto Q
-  softmax_scale = 1 / np.sqrt(d_head)
-
-  q_seq_n_tiles, q_seq_tile_size = 1 // 1, 1
-  k_seq_n_tiles, k_seq_tile_size = seqlen // 128, 128
-  # No tiling on d_head dimension since the dimension of d_head fits in SB
-  d_head_tile_size = d_head
-  v_seq_n_tiles, v_seq_tile_size = seqlen // 128, 128
-
-  ###################################
-  # Step 1. transpose(tensor_v)
-  ###################################
-  # Buffer for v matrix transposed
-  # Pre-fetch and keep it in SBUF throughout different softmax tiles
-  trans_v = nl.ndarray((par_dim(v_seq_tile_size), v_seq_n_tiles, d_head), dtype=pe_in_dt)
-
-  for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
-    ip_v = nl.arange(v_seq_tile_size)[:, None]
-    if_v = nl.arange(d_head_tile_size)[None, :]
-    trans_v[ip_v, i_k_seq_tile, if_v] = nl.load(
-      v_ref[i_k_seq_tile * k_seq_tile_size + ip_v, if_v],
-      dtype=pe_in_dt)
-
-  q_local = nl.ndarray((q_seq_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=pe_in_dt)
-  ip_q = nl.arange(d_head_tile_size)[:, None]
-  if_q = nl.arange(q_seq_tile_size)[None, :]
-  for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):
-    q_local[i_q_seq_tile, ip_q, if_q] = nl.load_transpose2d(
-      q_ref[i_q_seq_tile * q_seq_tile_size + nl.arange(q_seq_tile_size)[:, None],
-            nl.arange(d_head_tile_size)[None, :]
-      ],
-      dtype=pe_in_dt) * softmax_scale
-
-  k_local = nl.ndarray((k_seq_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size), dtype=pe_in_dt)
-  ip_k = nl.arange(d_head_tile_size)[:, None]
-  if_k = nl.arange(k_seq_tile_size)[None, :]
-  for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
-    k_local[i_k_seq_tile, ip_k, if_k] = nl.load_transpose2d(
-      k_ref[i_k_seq_tile * k_seq_tile_size + nl.arange(k_seq_tile_size)[:, None],
-            nl.arange(d_head_tile_size)[None, :]],
-      dtype=pe_in_dt)
-
-  for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):  # indent = 2
-    # A SBUF buffer for an independent softmax tile
-    qk_res_buf = nl.ndarray((par_dim(q_seq_tile_size), seqlen), dtype=kernel_dtype)
-
-    neg_max_res = nl.ndarray((par_dim(q_seq_tile_size), k_seq_n_tiles), dtype=kernel_dtype)
-    ip_max_q = nl.arange(q_seq_tile_size)[:, None]
-    if_max = nl.arange(k_seq_n_tiles)[None, :]
-
-    # Loop over RHS free of matmul(stationary=tensor_q, moving=tensor_k, contract=d_head)
-    for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):  # indent = 4
-
-      # Since the K^T tile is the RHS, the q_seq_len dimension will be P in the result
-      # PSUM buffer shape: [q_seq_tile_size P, k_seq_tile_size F]
-      qk_psum = nl.zeros((par_dim(q_seq_tile_size), k_seq_tile_size),
-                         dtype=np.float32, buffer=nl.psum)
-
-      # Tensor indices for accessing qk result in k_seq_tile_size
-      ip_qk = nl.arange(q_seq_tile_size)[:, None]
-      if_qk = nl.arange(k_seq_tile_size)[None, :]
-
-      ##############################################################
-      # Step 2. matmul(stationary=tensor_q, moving=tensor_k, contract=d_head)
-      ##############################################################
-      qk_psum[ip_qk, if_qk] += nisa.nc_matmul(moving=k_local[i_k_seq_tile, ip_k, if_k],
-                                              stationary=q_local[i_q_seq_tile, ip_q, if_q])
-
-      ###################################
-      # Step 3. Apply optional causal mask
-      ###################################
-      # if use_causal_mask:
-      #   # Magic number -9984.0 to replace -inf similar to what neuronx-cc uses
-      #   qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nisa.affine_select(
-      #     pred=(i_q_seq_tile * q_seq_tile_size + ip_qk >= i_k_seq_tile * k_seq_tile_size + if_qk),
-      #     on_true_tile=qk_psum[ip_qk, if_qk], on_false_value=-9984.0, dtype=kernel_dtype)
-      # else:
-      #   # Simply send psum result back to sbuf
-      #   qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.copy(qk_psum[ip_qk, if_qk],
-      #                                                                         dtype=kernel_dtype)
-
-      if att_mask is not None:
-        mask_sbuf = nl.load(att_mask[i_q_seq_tile * q_seq_tile_size + ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk], dtype=att_mask.dtype)
-        qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.where(mask_sbuf, qk_psum[ip_qk, if_qk], -9984.0, dtype=kernel_dtype)
-      else:
-        qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.copy(qk_psum[ip_qk, if_qk], dtype=kernel_dtype)
-
-
-
-      ###################################
-      # Step 4. Softmax
-      ###################################
-      neg_max_res[ip_max_q, i_k_seq_tile] = nisa.tensor_reduce(
-        np.max, data=qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk],
-        axis=(1,), dtype=kernel_dtype, negate=True)
-
-    neg_max_res_final = nisa.tensor_reduce(
-      np.min, data=neg_max_res[ip_max_q, if_max],
-      axis=(1,), dtype=kernel_dtype, negate=False)
-
-    ip_softmax = nl.arange(q_seq_tile_size)[:, None]
-    if_softmax = nl.arange(seqlen)[None, :]
-    ip_sum_res = nl.arange(q_seq_tile_size)[:, None]
-    if_sum_res = nl.arange(d_head_tile_size)[None, :]
-
-    softmax_res = nl.ndarray((par_dim(q_seq_tile_size), seqlen), dtype=pe_in_dt)
-    sum_divisor = nl.ndarray((par_dim(q_seq_tile_size), d_head_tile_size), dtype=kernel_dtype)
-
-    # Simply use a large tile of seq_len in size since this is a "blocking" instruction
-    # Assuming the compiler will merge exp and reduce_add into a single instruction on ACT
-    exp_res = nisa.activation(np.exp,
-                              data=qk_res_buf[ip_softmax, if_softmax],
-                              bias=neg_max_res_final, scale=1.0)
-
-    sum_res = nisa.tensor_reduce(np.add, data=exp_res, axis=(1,),
-                          dtype=kernel_dtype)
-    softmax_res[ip_softmax, if_softmax] = nl.copy(exp_res, dtype=pe_in_dt)
-
-    sum_reciprocal_broadcast = (1.0 / sum_res).broadcast_to((q_seq_tile_size, d_head_tile_size))
-    sum_divisor[ip_sum_res, if_sum_res] = nl.copy(sum_reciprocal_broadcast, dtype=kernel_dtype)
-
-    # Buffer for transposed softmax results (FP32 in PSUM)
-    trans_softmax_res = nl.ndarray(
-      (par_dim(k_seq_tile_size), k_seq_n_tiles, q_seq_tile_size),
-      dtype=pe_in_dt)
-
-    # Result psum buffer has the hidden dim as P
-    attn_res_psum = nl.zeros((par_dim(d_head_tile_size), q_seq_tile_size),
-                             dtype=np.float32, buffer=nl.psum)
-
-    ip_scores_t = nl.arange(k_seq_tile_size)[:, None]
-    if_scores_t = nl.arange(q_seq_tile_size)[None, :]
-    # Loop over matmul_1 contraction
-    for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
-      ###################################
-      # Step 5. transpose(softmax_res)
-      ###################################
-      ip_scores = nl.arange(q_seq_tile_size)[:, None]
-      if_scores = nl.arange(k_seq_tile_size)[None, :]
-
-      trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t] = nisa.nc_transpose(
-        softmax_res[ip_scores, i_k_seq_tile * k_seq_tile_size + if_scores])
-
-    ip_out = nl.arange(d_head_tile_size)[:, None]
-    if_out = nl.arange(q_seq_tile_size)[None, :]
-    for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
-      ######################################################################
-      # Step 6. matmul_1(stationary=trans_v, moving=trans_softmax_res, contract=seqlen_v=seqlen_k)
-      ######################################################################
-      ip_v_t = nl.arange(k_seq_tile_size)[:, None]
-      if_v_t = nl.arange(d_head_tile_size)[None, :]
-      attn_res_psum[ip_out, if_out] += \
-        nisa.nc_matmul(moving=trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t],
-                       stationary=trans_v[ip_v_t, i_k_seq_tile, if_v_t])
-
-    attn_res_sbuf = nl.copy(attn_res_psum[ip_out, if_out], dtype=kernel_dtype)
-
-    attn_res_div = attn_res_sbuf * nisa.nc_transpose(sum_divisor[ip_sum_res, if_sum_res])
-
-    nl.store(
-      out_ref[b_i, h_i ,i_q_seq_tile * q_seq_tile_size + if_out, ip_out],
-      value=attn_res_div)
-
-  return out_ref
-# NKI_EXAMPLE_31_END
-
-def fused_att_interface_decode(Q, K, V, use_causal_mask=False, mixed_precision=True, att_mask=None):
-    B, H, Q_S, D = Q.shape
-    assert Q_S == 1, "Q sequence length must be 1"
-    S = K.shape[2]
-    assert K.shape == V.shape == (B, H, S, D), f"K/V shape mismatch! Expected {(B, H, S, D)}, got K:{K.shape}, V:{V.shape}"
-    
-    S_padded = ((S + 255) // 256) * 256  
-    padding_needed = S_padded - S
-    
-    K = torch.nn.functional.pad(K, (0, 0, 0, padding_needed))  # (B, H, S_padded, D)
-    V = torch.nn.functional.pad(V, (0, 0, 0, padding_needed))  # (B, H, S_padded, D)
-    
-    if att_mask is not None:
-        assert att_mask.shape == (1, 1, 1, S), f"Mask shape {att_mask.shape} should be (1,1,1,{S})"
-        pad_mask = torch.zeros((1, 1, 1, S_padded), dtype=torch.bool, device=Q.device)
-        pad_mask[:, :, :, :S] = att_mask  # 仅填充有效区域
-    else:
-        pad_mask = torch.zeros((1, 1, 1, S_padded), dtype=torch.bool, device=Q.device)
-        pad_mask[:, :, :, :S] = True
-    
-    if S_padded > 2**14:
-        chunk_size = 2**14
-        K_chunks = torch.split(K, chunk_size, dim=2)
-        V_chunks = torch.split(V, chunk_size, dim=2)
-        mask_chunks = torch.split(pad_mask, chunk_size, dim=-1)
-        
-        outputs = []
-        for k_chunk, v_chunk, mask_chunk in zip(K_chunks, V_chunks, mask_chunks):
-            chunk_output = fused_self_attn_for_SD_small_head_size_decode[B,H](
-                Q,          # (B,H,1,D)
-                k_chunk,    # (B,H,chunk_size,D)
-                v_chunk,    # (B,H,chunk_size,D)
-                use_causal_mask,
-                mixed_precision,
-                mask_chunk  # (1,1,1,chunk_size)
-            )
-            outputs.append(chunk_output)
-        
-        return torch.cat(outputs, dim=2)[:, :, :S, :]
-    else:
-        return fused_self_attn_for_SD_small_head_size_decode[B,H](
-            Q, K, V, 
-            use_causal_mask, 
-            mixed_precision, 
-            pad_mask.view(1, S_padded)
-        )[:, :, :S, :]
 
 
 @register_module("NeuronLlamaAttention")
@@ -3274,44 +3273,6 @@ class NeuronLlamaAttention(NeuronLlamaAttentionBase):
 
         return attn_output
 
-    # def compute_for_token_gen(
-    #     self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
-    # ) -> Tensor:
-    #     """attention computation at token generation phase"""
-    #     # is_speculation = position_ids.shape[-1] > 1
-
-    #     # # Attention computation: softmax((Q.K/√dkv) + mask).V
-    #     # # i. prior (cached) KV
-    #     K_prior, V_prior = past_key_value
-    #     K_prior = repeat_kv(K_prior, self.num_key_value_groups)
-    #     V_prior = repeat_kv(V_prior, self.num_key_value_groups)
-
-    #     # # 合并 K_prior 和 K_active
-    #     K_active = repeat_kv(K, self.num_key_value_groups)  # (B, H, 1, D)
-    #     K_combined = torch.cat([K_prior, K_active], dim=2)  # (B, H, S+1, D)
-
-    #     # # 合并 V_prior 和 V_active
-    #     V_active = repeat_kv(V, self.num_key_value_groups)
-    #     V_combined = torch.cat([V_prior, V_active], dim=2)  # (B, H, S+1, D)
-
-    #     # # 合并注意力掩码
-    #     if active_mask is None:
-    #         active_mask = torch.ones((1, 1, 1, 1), dtype=torch.bool, device=Q.device)
-    #     combined_mask = torch.cat([attention_mask, active_mask], dim=-1)  # (B, 1, 1, S+1)
-
-    #     # # 统一计算注意力分数
-    #     # scores = torch.matmul(Q, K_combined.transpose(2, 3)) / math.sqrt(self.head_dim)
-    #     # scores = torch.where(
-    #     #     combined_mask, 
-    #     #     scores, 
-    #     #     torch.finfo(scores.dtype).min
-    #     # )
-    #     # attn_weights = torch.nn.functional.softmax(scores, dim=-1)  # (B, H, 1, S+1)
-
-    #     # # 计算注意力输出
-    #     # attn_output = torch.matmul(attn_weights, V_combined)  # (B, H, 1, D)
-    #     attn_output = fused_att_interface_decode(Q, K_combined, V_combined, att_mask=combined_mask.view(1, 1, 1, -1))
-    #     return attn_output
 
 
 # TODO: Modularize RotaryEmbedding. See how HF transformers does it in 4.43.
@@ -3431,10 +3392,10 @@ class NeuronLlamaDecoderLayer(nn.Module):
 
         # RMSNorm (fused with QKV kernel when SP is disabled)
         if (not self.qkv_kernel_enabled or self.sequence_parallel_enabled) and self.input_layernorm:
-            import time
-            s = time.perf_counter()
+            # import time
+            # s = time.perf_counter()
             hidden_states = self.input_layernorm(hidden_states)
-            print("rms norm time: ", (time.perf_counter() - s) * 1000)
+            # print("rms norm time: ", (time.perf_counter() - s) * 1000)
 
         # Self Attention
         hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
